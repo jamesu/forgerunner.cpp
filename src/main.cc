@@ -7,6 +7,7 @@
 #include <mutex>
 #include <atomic>
 #include <curl/curl.h>
+#include <fkYAML/node.hpp>
 
 // Protobuf
 #include <google/protobuf/util/json_util.h>
@@ -162,6 +163,8 @@ void PrintTaskDetails(const runner::v1::Task& task)
    }
 }
 
+struct JobStep;
+
 // Thread safe util class to handle updating a task.
 // Note that changes are effectively batched until HealthCheck dispatches API calls.
 struct TaskTracker
@@ -196,11 +199,14 @@ struct TaskTracker
    uint64_t mLastLogAck;
    uint64_t mLastTaskAck;
    
+   std::vector<JobStep*> mSteps;
+   
    std::mutex mMutex;
+   std::mutex mJobInfoMutex;
    std::atomic<bool> mFinished;
    std::atomic<bool> mCancelled;
    
-   TaskTracker(const runner::v1::Task& task)
+   TaskTracker(const runner::v1::Task& task, std::vector<JobStep*>& steps)
    {
       mTask = task;
       mNextTaskRequest.mutable_state()->set_id(task.id());
@@ -208,6 +214,7 @@ struct TaskTracker
       mLastTaskAck = 0;
       mHeadLog = new LogBatch(task.id());
       mNextStepState = NULL;
+      mSteps = steps;
       
       mFinished = false;
       mCancelled = false;
@@ -215,7 +222,22 @@ struct TaskTracker
    
    ~TaskTracker()
    {
+      // Cleanup steps
+      for (JobStep* step : mSteps)
+      {
+         delete step;
+      }
       delete mHeadLog;
+   }
+   
+   void beginJob()
+   {
+      mJobInfoMutex.lock();
+   }
+   
+   void endJob()
+   {
+      mJobInfoMutex.unlock();
    }
    
    google::protobuf::Timestamp getNowTS()
@@ -567,6 +589,157 @@ bool HealthCheck(CURL *curl, RunnerState& state, TaskTracker* tracker)
    return true;
 }
 
+struct JobStep
+{
+   struct JobKV
+   {
+      std::string key;
+      std::string value;
+   };
+   
+   std::string mName;
+   std::string mId;
+   std::string mConditional;
+   std::vector<JobKV> mEnv;
+   int32_t mTimeoutMinutes;
+   bool mContinueOnError;
+   
+   JobStep()
+   {
+      mTimeoutMinutes = 10;
+      mContinueOnError = false;
+   }
+   
+   virtual ~JobStep() = default;
+   
+   static void addKeysFromMap(std::vector<JobKV>& kvs, const fkyaml::node::mapping_type& yaml_map)
+   {
+      for (auto itr = yaml_map.begin(), itrEnd = yaml_map.end(); itr != itrEnd; itr++)
+      {
+         JobKV kv;
+         kv.key = itr->first.as_str();
+         kv.value = itr->second.as_str();
+         kvs.emplace_back(kv);
+      }
+   }
+   
+   virtual void fromYAML(const fkyaml::node::mapping_type& yaml_map)
+   {
+      auto itr = yaml_map.find("name");
+      if (itr != yaml_map.end())
+      {
+         mName = itr->second.as_str();
+      }
+      itr = yaml_map.find("id");
+      if (itr != yaml_map.end())
+      {
+         mId = itr->second.as_str();
+      }
+      itr = yaml_map.find("if");
+      if (itr != yaml_map.end())
+      {
+         mConditional = itr->second.as_str();
+      }
+      itr = yaml_map.find("timeout-minutes");
+      if (itr != yaml_map.end())
+      {
+         mTimeoutMinutes = (int)itr->second.as_int();
+      }
+      itr = yaml_map.find("continue-on-error");
+      if (itr != yaml_map.end())
+      {
+         mContinueOnError = itr->second.as_bool();
+      }
+      itr = yaml_map.find("env");
+      if (itr != yaml_map.end())
+      {
+         addKeysFromMap(mEnv, itr->second.as_map());
+      }
+   }
+   
+   static void createFromYAML(std::vector<JobStep*>& outSteps, const fkyaml::node::mapping_type& yaml_map);
+   
+   virtual runner::v1::Result execute()=0;
+};
+
+struct UsesJobStep : public JobStep
+{
+   std::string mUses;
+   std::vector<JobKV> mWith;
+   
+   virtual void fromYAML(const fkyaml::node::mapping_type& yaml_map)
+   {
+      JobStep::fromYAML(yaml_map);
+      
+      auto itr = yaml_map.find("uses");
+      if (itr != yaml_map.end())
+      {
+         mUses = itr->second.as_str();
+      }
+      itr = yaml_map.find("with");
+      if (itr != yaml_map.end())
+      {
+         addKeysFromMap(mWith, itr->second.as_map());
+      }
+   }
+   
+   virtual runner::v1::Result execute()
+   {
+      printf("!! TODO: exec uses\n");
+      return runner::v1::RESULT_SUCCESS;
+   }
+};
+
+struct RunJobStep : public JobStep
+{
+   std::string mCmd;
+   std::string mShell;
+   std::string mCwd;
+   
+   virtual void fromYAML(const fkyaml::node::mapping_type& yaml_map)
+   {
+      JobStep::fromYAML(yaml_map);
+      
+      auto itr = yaml_map.find("run");
+      if (itr != yaml_map.end())
+      {
+         mCmd = itr->second.as_str();
+      }
+      itr = yaml_map.find("shell");
+      if (itr != yaml_map.end())
+      {
+         mShell = itr->second.as_str();
+      }
+      itr = yaml_map.find("working-directory");
+      if (itr != yaml_map.end())
+      {
+         mCwd = itr->second.as_str();
+      }
+   }
+   
+   virtual runner::v1::Result execute()
+   {
+      printf("!! TODO: exec run\n");
+      return runner::v1::RESULT_SUCCESS;
+   }
+};
+
+void JobStep::createFromYAML(std::vector<JobStep*>& outSteps, const fkyaml::node::mapping_type& yaml_map)
+{
+   if (yaml_map.find("uses") != yaml_map.end())
+   {
+      UsesJobStep* step = new UsesJobStep();
+      outSteps.push_back(step);
+      step->fromYAML(yaml_map);
+   }
+   else if (yaml_map.find("run") != yaml_map.end())
+   {
+      RunJobStep* step = new RunJobStep();
+      outSteps.push_back(step);
+      step->fromYAML(yaml_map);
+   }
+}
+
 // Polls for a task on the server
 TaskTracker* PollForTask(CURL* curl, RunnerState& state)
 {
@@ -592,7 +765,45 @@ TaskTracker* PollForTask(CURL* curl, RunnerState& state)
       {
          printf("Runner has a task!\n");
          PrintTaskDetails(rspTask.task());
-         tracker = new TaskTracker(rspTask.task());
+         std::vector<JobStep*> steps;
+
+         if (!rspTask.task().has_workflow_payload())
+         {
+            return NULL;
+         }
+
+         try
+         {
+            auto node = fkyaml::node::deserialize(rspTask.task().workflow_payload());
+            auto jobList = node["jobs"].as_map();
+
+            if (!jobList.empty())
+            {
+               auto jobInfo = jobList.begin()->second.as_map();
+               if (!jobInfo["steps"].is_null())
+               {
+                  auto jobSteps = jobInfo["steps"].as_seq();
+                  size_t numSteps = jobSteps.size();
+                  
+                  for (const auto& step : jobSteps)
+                  {
+                     JobStep::createFromYAML(steps, step.as_map());
+                  }
+               }
+            }
+            
+         }
+         catch (const std::exception& e)
+         {
+            // Cleanup steps
+            for (JobStep* step : steps)
+            {
+               delete step;
+            }
+            return NULL;
+         }
+
+         tracker = new TaskTracker(rspTask.task(), steps);
       }
    }
    
@@ -602,24 +813,40 @@ TaskTracker* PollForTask(CURL* curl, RunnerState& state)
 // Example thread to send dummy updates to the server
 void PerformTask(TaskTracker* currentTask)
 {
-   currentTask->log("Will PerformTask...");
+   char buffer[512];
+   currentTask->beginJob();
+   snprintf(buffer, sizeof(buffer), "Performing %i tasks...", currentTask->mSteps.size());
+   currentTask->log(buffer);
+  
    //
-   currentTask->beginStep(0);
-   currentTask->log("Doing something");
-   sleep(1);
-   currentTask->log("Doing something else");
-   currentTask->endStep(runner::v1::RESULT_SUCCESS);
+   uint32_t stepCount = 0;
+   runner::v1::Result jobResult = runner::v1::RESULT_SUCCESS;
+   
+   for (JobStep* step : currentTask->mSteps)
+   {
+      currentTask->beginStep(stepCount);
+      snprintf(buffer, sizeof(buffer), "Doing something in step %u...", stepCount);
+      currentTask->log(buffer);
+      runner::v1::Result result = step->execute();
+      
+      if (!(result == runner::v1::RESULT_SUCCESS || result == runner::v1::RESULT_SKIPPED) && !step->mContinueOnError)
+      {
+         jobResult = result;
+         currentTask->endStep(result);
+         break;
+      }
+      
+      sleep(1);
+      currentTask->endStep(result);
+      stepCount++;
+   }
+   
    //
-   currentTask->beginStep(1);
-   currentTask->log("Doing something in another step");
-   sleep(1);
-   currentTask->log("Doing something else in another step");
-   currentTask->endStep(runner::v1::RESULT_SUCCESS);
-   //
-   currentTask->setResult(runner::v1::RESULT_SUCCESS);
+   currentTask->setResult(jobResult);
    currentTask->log("End of job reached", true);
    currentTask->waitForLogSync();
    //
+   currentTask->endJob();
    currentTask->setFinished();
 }
 

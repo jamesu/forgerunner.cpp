@@ -16,7 +16,7 @@ find_package(Protobuf REQUIRED)
 find_package(absl REQUIRED)
 
 # Include directories
-include_directories(${CURL_INCLUDE_DIRS} ${Protobuf_INCLUDE_DIRS} . ./proto_src)
+include_directories(${CURL_INCLUDE_DIRS} ${Protobuf_INCLUDE_DIRS} . ./proto_src ./include)
 
 # Source file
 add_executable(forgerunner ${SRC_FILES} ${PROTO_SRC_FILES})
