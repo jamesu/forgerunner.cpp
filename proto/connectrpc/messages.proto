@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package connectrpc;
+
+message ErrorDetailItem {
+  string type = 1;   // e.g., "google.rpc.RetryInfo"
+  string value = 2;  // e.g., "CgIIPA" (base64 or protobuf-encoded content)
+}
+
+message ErrorDetail {
+  string code = 1;
+  string message = 2;
+  repeated ErrorDetailItem details = 3; 
+}
