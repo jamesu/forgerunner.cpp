@@ -20,6 +20,7 @@ include_directories(${CURL_INCLUDE_DIRS} ${Protobuf_INCLUDE_DIRS} . ./proto_src 
 
 # Source file
 add_executable(forgerunner ${SRC_FILES} ${PROTO_SRC_FILES})
+add_executable(tokentest test/tokentest.cpp)
 
 # Link libraries
 target_link_libraries(forgerunner ${CURL_LIBRARIES} ${Protobuf_LIBRARIES}
