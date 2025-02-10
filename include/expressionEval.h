@@ -39,7 +39,7 @@ struct Token {
 
 struct FuncInfo
 {
-   typedef ExprValue (*FuncPtr)(ExprState*, int, ExprValue**);
+   typedef ExprValue (*FuncPtr)(ExprState*, int, ExprValue*);
    
    const char* mName;
    FuncPtr mPtr;
@@ -66,15 +66,15 @@ struct ExprValue
 struct ExprState
 {
    std::vector<ExprObject*> mObjects;
-   std::unordered_map<std::string, ExprValue> mContexts;
-   static std::unordered_map<std::string, FuncInfo> mFunctions;
+   std::unordered_map<std::string, ExprObject*> mContexts;
+   static std::unordered_map<std::string, FuncInfo> smFunctions;
    ExprValue mValue;
    
    void addObject(ExprObject* obj);
    ExprValue callFunction(const char* name, int argc, ExprValue* args);
    ExprValue evaluate(ExprNode* root);
    void setContext(const char* name, ExprObject* obj);
-   ExprValue getContext(const char* name);
+   ExprObject* getContext(const char* name);
    
    ExprState();
    ~ExprState();
@@ -466,22 +466,32 @@ inline void ExprState::addObject(ExprObject* obj)
 
 inline ExprValue ExprState::callFunction(const char* name, int argc, ExprValue* args)
 {
-   return ExprValue(); // TODO
+   auto itr = smFunctions.find(name);
+   if (itr == smFunctions.end())
+   {
+      throw std::runtime_error("Invalid function");
+   }
+   return itr->second.mPtr(this, argc, args);
 }
 
 inline ExprValue ExprState::evaluate(ExprNode* root)
 {
-   return ExprValue(); // TODO
+   return root->evaluate(*this);
 }
 
 inline void ExprState::setContext(const char* name, ExprObject* obj)
 {
-    // TODO
+   mContexts[name] = obj;
 }
 
-inline ExprValue ExprState::getContext(const char* name)
+inline ExprObject* ExprState::getContext(const char* name)
 {
-   return ExprValue(); // TODO
+   auto itr = mContexts.find(name);
+   if (itr == mContexts.end())
+   {
+      throw std::runtime_error("Couldn't find context %s");
+   }
+   return itr->second;
 }
 
 inline void ExprState::clear()
@@ -681,7 +691,9 @@ inline IdentifierNode::IdentifierNode(std::string name) : mName(std::move(name))
 
 inline ExprValue IdentifierNode::evaluate(ExprState& state)
 {
-   return state.getContext(mName.c_str());
+   ExprValue val;
+   val.setObject(state.getContext(mName.c_str()));
+   return val;
 }
 
 inline LiteralNode::LiteralNode(ExprValue value) : mValue(value)
@@ -900,7 +912,7 @@ inline ExprNode* Parser::parseDotAccess(ExprNode* primary)
       }
       else if (match(TokenType::OP_MUL))
       {
-         std::string rightKey;
+         ExprValue rightKey;
          advance(); // consume '*'
          
          if (match(TokenType::DOT))
@@ -908,12 +920,12 @@ inline ExprNode* Parser::parseDotAccess(ExprNode* primary)
             advance(); // consume '.'
             while (match(TokenType::IDENTIFIER))
             {
-               rightKey += advance().value;
+               rightKey.value += advance().value;
                if (!match(TokenType::DOT))
                {
                   break;
                }
-               rightKey += ".";
+               rightKey.value += ".";
                advance(); // consume '.'
             }
          }
@@ -924,7 +936,7 @@ inline ExprNode* Parser::parseDotAccess(ExprNode* primary)
             return NULL;
          }
          
-         primary = allocNode<ExpandoNode>(primary, new IdentifierNode(rightKey));
+         primary = allocNode<ExpandoNode>(primary, new LiteralNode(rightKey));
       }
       else
       {
