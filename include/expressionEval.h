@@ -124,6 +124,7 @@ struct ExprState
    void setContext(const char* name, ExprObject* obj);
    ExprObject* getContext(const char* name);
    std::string substituteExpressions(const std::string &input, int8_t depth=MaxStackDepth);
+   ExprValue substituteSingleExpression(const std::string &input, int8_t depth=MaxStackDepth);
    ExprValue evaluateString(const std::string &input);
    
    ExprState();
@@ -788,6 +789,25 @@ std::string ExprState::substituteExpressions(const std::string &input, int8_t de
     }
 
     return output;
+}
+
+ExprValue ExprState::substituteSingleExpression(const std::string &input, int8_t depth)
+{
+   std::string output;
+   size_t pos = 0;
+   
+   size_t start = input.find("${{", pos);
+   if (start != std::string::npos)
+   {
+      size_t end = input.find("}}", start);
+      if (end != std::string::npos)
+      {
+         std::string expression = input.substr(start + 3, end - (start + 3));
+         return evaluateString(expression);
+      }
+   }
+   
+   return evaluateString(input);
 }
 
 ExprValue ExprState::evaluateString(const std::string &input)

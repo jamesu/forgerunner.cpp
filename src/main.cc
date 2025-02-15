@@ -711,7 +711,7 @@ struct BasicContext : public ExprFieldObject
    ExprValue mName;
    ExprValue mId;
    
-   ExpressionEval::CompiledStatement mConditional;
+   ExprValue mConditional;
    
    ExprValue mInputs;
    ExprValue mOutputs;
@@ -1311,6 +1311,28 @@ void PerformTask(TaskTracker* currentTask)
    exprState->setContext("strategy", new ExprMap(exprState));
    exprState->setContext("matrix", new ExprMap(exprState));
    
+   // Check if job has "if"
+   if (jobContext->mConditional.getString())
+   {
+      std::string conditional = jobContext->mConditional.getString();
+      ExprValue conditionalValue = exprState->substituteSingleExpression(conditional);
+      if (conditionalValue.getBool() == false)
+      {
+         // Skip job
+         currentTask->setResult(runner::v1::RESULT_SKIPPED);
+         currentTask->log("Job conditional test failed", true);
+         currentTask->waitForLogSync();
+         //
+         currentTask->endJob();
+         currentTask->setFinished();
+         return;
+      }
+      else
+      {
+         currentTask->log("Job conditional test passed");
+      }
+   }
+   
    std::vector<JobStep*> steps;
    getTypedObjectsFromArray<JobStep>(jobContext->mSteps.asObject<ExprArray>(), steps);
    // SETUP DONE
@@ -1328,8 +1350,26 @@ void PerformTask(TaskTracker* currentTask)
       env->mSlots[2] = step->mEnv.getObject();
       exprState->setContext("inputs", gitContext->getMapKey("event").getObject()->getMapKey("inputs").getObject());
       
-      //
       currentTask->beginStep(stepCount);
+      
+      // Check if step has "if"
+      if (step->mConditional.getString())
+      {
+         std::string conditional = step->mConditional.getString();
+         ExprValue conditionalValue = exprState->substituteSingleExpression(conditional);
+         if (conditionalValue.getBool() == false)
+         {
+            // Skip job
+            currentTask->log("Step conditional test failed", true);
+            currentTask->endStep(runner::v1::RESULT_SKIPPED);
+            continue;
+         }
+         else
+         {
+            currentTask->log("Step conditional test passed");
+         }
+      }
+      
       snprintf(buffer, sizeof(buffer), "Doing something in step %u...", stepCount);
       currentTask->log(buffer);
       runner::v1::Result result = step->execute(currentTask);
