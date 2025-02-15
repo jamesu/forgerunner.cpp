@@ -840,19 +840,19 @@ struct RunnerInfo : public ExprFieldObject
 
 template<> void ExprFieldObject::registerFieldsForType<RunnerInfo>()
 {
-   registerField<JobContext>("id", offsetof(RunnerInfo, mId), ExprValue::STRING);
-   registerField<JobContext>("uuid", offsetof(RunnerInfo, mUUID), ExprValue::STRING);
-   registerField<JobContext>("token", offsetof(RunnerInfo, mToken), ExprValue::STRING);
-   registerField<JobContext>("name", offsetof(RunnerInfo, mName), ExprValue::STRING);
-   registerField<JobContext>("status", offsetof(RunnerInfo, mStatus), ExprValue::STRING);
-   registerField<JobContext>("labels", offsetof(RunnerInfo, mLabels), ExprValue::OBJECT, false);
+   registerField<RunnerInfo>("id", offsetof(RunnerInfo, mId), ExprValue::STRING);
+   registerField<RunnerInfo>("uuid", offsetof(RunnerInfo, mUUID), ExprValue::STRING);
+   registerField<RunnerInfo>("token", offsetof(RunnerInfo, mToken), ExprValue::STRING);
+   registerField<RunnerInfo>("name", offsetof(RunnerInfo, mName), ExprValue::STRING);
+   registerField<RunnerInfo>("status", offsetof(RunnerInfo, mStatus), ExprValue::STRING);
+   registerField<RunnerInfo>("labels", offsetof(RunnerInfo, mLabels), ExprValue::OBJECT, false);
    //
-   registerField<JobContext>("os", offsetof(RunnerInfo, mOs), ExprValue::STRING);
-   registerField<JobContext>("arch", offsetof(RunnerInfo, mArch), ExprValue::STRING);
-   registerField<JobContext>("temp", offsetof(RunnerInfo, mTemp), ExprValue::STRING);
-   registerField<JobContext>("tool_cache", offsetof(RunnerInfo, mToolCache), ExprValue::STRING);
-   registerField<JobContext>("debug", offsetof(RunnerInfo, mDebug), ExprValue::BOOLEAN);
-   registerField<JobContext>("environment", offsetof(RunnerInfo, mEnvironment), ExprValue::STRING);
+   registerField<RunnerInfo>("os", offsetof(RunnerInfo, mOs), ExprValue::STRING);
+   registerField<RunnerInfo>("arch", offsetof(RunnerInfo, mArch), ExprValue::STRING);
+   registerField<RunnerInfo>("temp", offsetof(RunnerInfo, mTemp), ExprValue::STRING);
+   registerField<RunnerInfo>("tool_cache", offsetof(RunnerInfo, mToolCache), ExprValue::STRING);
+   registerField<RunnerInfo>("debug", offsetof(RunnerInfo, mDebug), ExprValue::BOOLEAN);
+   registerField<RunnerInfo>("environment", offsetof(RunnerInfo, mEnvironment), ExprValue::STRING);
 }
 
 template<> void ExprFieldObject::registerFieldsForType<JobStep>()
@@ -1311,6 +1311,10 @@ void PerformTask(TaskTracker* currentTask)
    exprState->setContext("strategy", new ExprMap(exprState));
    exprState->setContext("matrix", new ExprMap(exprState));
    
+   std::vector<JobStep*> steps;
+   getTypedObjectsFromArray<JobStep>(jobContext->mSteps.asObject<ExprArray>(), steps);
+   
+   printf("Running job %s\n", jobName.c_str());
    // Check if job has "if"
    if (jobContext->mConditional.getString())
    {
@@ -1319,6 +1323,11 @@ void PerformTask(TaskTracker* currentTask)
       if (conditionalValue.getBool() == false)
       {
          // Skip job
+         for (int i=0; i<steps.size(); i++)
+         {
+            currentTask->beginStep(i);
+            currentTask->endStep(runner::v1::RESULT_SKIPPED);
+         }
          currentTask->setResult(runner::v1::RESULT_SKIPPED);
          currentTask->log("Job conditional test failed", true);
          currentTask->waitForLogSync();
@@ -1333,8 +1342,6 @@ void PerformTask(TaskTracker* currentTask)
       }
    }
    
-   std::vector<JobStep*> steps;
-   getTypedObjectsFromArray<JobStep>(jobContext->mSteps.asObject<ExprArray>(), steps);
    // SETUP DONE
    
    snprintf(buffer, sizeof(buffer), "Performing %i tasks for job %s...", (int)steps.size(), jobName.c_str());
@@ -1360,8 +1367,9 @@ void PerformTask(TaskTracker* currentTask)
          if (conditionalValue.getBool() == false)
          {
             // Skip job
-            currentTask->log("Step conditional test failed", true);
+            currentTask->log("Step conditional test failed");
             currentTask->endStep(runner::v1::RESULT_SKIPPED);
+            stepCount++;
             continue;
          }
          else

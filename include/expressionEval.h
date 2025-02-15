@@ -257,6 +257,13 @@ struct ExprFieldObject : public ExprObject
       {
          typeMask |= ExprValue::NAN_MASK;
       }
+      for (auto& itr : fields)
+      {
+         if (itr.second.offset == offset)
+         {
+            throw std::runtime_error("Conflicting offsets");
+         }
+      }
       fields[std::string(name)] = { name, offset, typeMask, canSet };
    }
 };
@@ -827,6 +834,11 @@ ExprValue ExprState::evaluateString(const std::string &input)
    parser.mStringTable = mStringTable;
    // Compile
    CompiledStatement* stmts = parser.compile();
+   if (stmts == NULL)
+   {
+      return ExprValue();
+   }
+   
    // Evaluate
    ExprValue result = evaluate(stmts->mRoot);
    delete stmts;
