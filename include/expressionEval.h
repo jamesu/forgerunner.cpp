@@ -54,11 +54,7 @@ struct FuncInfo
 class StringTable
 {
 public:
-   const char* intern(const char* str)
-   {
-       auto it = table.insert(str).first;
-       return it->c_str();
-   }
+   const char* intern(const char* str);
 
 private:
    std::unordered_set<std::string> table;
