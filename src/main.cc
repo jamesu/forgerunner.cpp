@@ -17,6 +17,17 @@
 #include "runner/v1/services.pb.h"
 #include "connectrpc/messages.pb.h"
 
+#include "expressionEval.h"
+
+using ExprValue = ExpressionEval::ExprValue;
+using ExprObject = ExpressionEval::ExprObject;
+using ExprArray = ExpressionEval::ExprArray;
+using ExprMap = ExpressionEval::ExprMap;
+using ExprFieldObject = ExpressionEval::ExprFieldObject;
+using ExprMultiKey = ExpressionEval::ExprMultiKey;
+using ExprState = ExpressionEval::ExprState;
+using FuncInfo = ExpressionEval::FuncInfo;
+
 using namespace google::protobuf::util;
 
 // State to track runner auth and task version
@@ -164,6 +175,7 @@ void PrintTaskDetails(const runner::v1::Task& task)
 }
 
 struct JobStep;
+struct SingleWorkflowContext;
 
 // Thread safe util class to handle updating a task.
 // Note that changes are effectively batched until HealthCheck dispatches API calls.
@@ -199,14 +211,15 @@ struct TaskTracker
    uint64_t mLastLogAck;
    uint64_t mLastTaskAck;
    
-   std::vector<JobStep*> mSteps;
+   ExprState* mExprState;
+   SingleWorkflowContext* mWorkflow;
    
    std::mutex mMutex;
    std::mutex mJobInfoMutex;
    std::atomic<bool> mFinished;
    std::atomic<bool> mCancelled;
    
-   TaskTracker(const runner::v1::Task& task, std::vector<JobStep*>& steps)
+   TaskTracker(const runner::v1::Task& task, ExprState* state, SingleWorkflowContext* ctx)
    {
       mTask = task;
       mNextTaskRequest.mutable_state()->set_id(task.id());
@@ -214,7 +227,8 @@ struct TaskTracker
       mLastTaskAck = 0;
       mHeadLog = new LogBatch(task.id());
       mNextStepState = NULL;
-      mSteps = steps;
+      mExprState = state;
+      mWorkflow = ctx;
       
       mFinished = false;
       mCancelled = false;
@@ -222,11 +236,7 @@ struct TaskTracker
    
    ~TaskTracker()
    {
-      // Cleanup steps
-      for (JobStep* step : mSteps)
-      {
-         delete step;
-      }
+      // Cleanup
       delete mHeadLog;
    }
    
@@ -589,155 +599,432 @@ bool HealthCheck(CURL *curl, RunnerState& state, TaskTracker* tracker)
    return true;
 }
 
-struct JobStep
+// Converts YAML to an ExprValue, using an already constructed ExprObject if specified and the type matches
+ExprValue YAMLToExpr(ExprState& state, ExprObject* baseObject, fkyaml::node& node)
 {
-   struct JobKV
-   {
-      std::string key;
-      std::string value;
-   };
+   ExprArray* baseArray = dynamic_cast<ExprArray*>(baseObject);
+   ExprMap* baseMap = dynamic_cast<ExprMap*>(baseObject);
    
-   std::string mName;
-   std::string mId;
-   std::string mConditional;
-   std::vector<JobKV> mEnv;
-   int32_t mTimeoutMinutes;
-   bool mContinueOnError;
-   
-   JobStep()
+   ExprValue ret;
+   if (node.is_sequence())
    {
-      mTimeoutMinutes = 10;
-      mContinueOnError = false;
+      baseArray = baseObject ? baseArray : new ExprArray(&state);
+      if (baseArray == NULL)
+         return;
+      
+      for (auto& itr : node.as_seq())
+      {
+         ExprValue val = YAMLToExpr(state, NULL, itr);
+         baseArray->mItems.push_back(val);
+      }
+      ret.setObject(baseArray);
+   }
+   else if (node.is_mapping())
+   {
+      ExpressionEval::ExprMap* baseMap = baseObject ? baseMap : new ExpressionEval::ExprMap(&state);
+      if (baseMap == NULL)
+         return;
+      
+      for (auto& itr : node.as_map())
+      {
+         ExprValue val = YAMLToExpr(state, NULL, itr.second);
+         baseMap->mItems[itr.first.as_str()] = val;
+      }
+      ret.setObject(baseMap);
+   }
+   else if (node.is_float_number() && baseObject == NULL)
+   {
+      ret.setNumeric(node.as_float());
+   }
+   else if (node.is_boolean() && baseObject == NULL)
+   {
+      ret.setBool(node.as_bool());
+   }
+   else if (node.is_string() && baseObject == NULL)
+   {
+      ret.setString(*state.mStringTable, node.as_str().c_str());
+   }
+   
+   return ret;
+}
+
+struct SingleWorkflowContext : public ExprFieldObject
+{
+   ExprValue mName;
+   ExprValue mOn;
+   ExprValue mEnv;
+   ExprValue mJobs;
+   ExprValue mDefaults;
+   
+   SingleWorkflowContext(ExprState* state);
+   
+   std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<SingleWorkflowContext>(); }
+};
+
+template<> void ExprFieldObject::registerFieldsForType<SingleWorkflowContext>()
+{
+   registerField<SingleWorkflowContext>("name", offsetof(SingleWorkflowContext, mName), ExprValue::STRING);
+   registerField<SingleWorkflowContext>("on", offsetof(SingleWorkflowContext, mOn), ExprValue::OBJECT);
+   registerField<SingleWorkflowContext>("env", offsetof(SingleWorkflowContext, mEnv), ExprValue::OBJECT);
+   registerField<SingleWorkflowContext>("jobs", offsetof(SingleWorkflowContext, mJobs), ExprValue::OBJECT, false);
+   registerField<SingleWorkflowContext>("defaults", offsetof(SingleWorkflowContext, mDefaults), ExprValue::OBJECT);
+}
+
+// Context shared with jobs and steps
+struct BasicContext : public ExprFieldObject
+{
+   typedef ExprFieldObject Parent;
+   
+   runner::v1::Task* mTask;
+   ExprValue mName;
+   ExprValue mId;
+   
+   ExpressionEval::CompiledStatement mConditional;
+   
+   ExprValue mInputs;
+   ExprValue mOutputs;
+   ExprValue mEnv;
+   
+   ExprValue mTimeoutMinutes;
+   ExprValue mContinueOnError;
+   
+   ExprValue mUses;
+   ExprValue mWith;
+   
+   BasicContext(ExprState* state) : ExprFieldObject(state)
+   {
+      mTask = NULL;
+      mTimeoutMinutes = ExprValue().setNumeric(10);
+      mContinueOnError = ExprValue().setBool(false);
+   }
+   
+   std::string toString() override { return ""; }
+   std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<BasicContext>(); }
+};
+
+
+template<> void ExprFieldObject::registerFieldsForType<BasicContext>()
+{
+   registerField<BasicContext>("uses", offsetof(BasicContext, mUses), ExprValue::STRING);
+   registerField<BasicContext>("with", offsetof(BasicContext, mWith), ExprValue::OBJECT);
+   registerField<BasicContext>("name", offsetof(BasicContext, mName), ExprValue::STRING);
+   registerField<BasicContext>("id", offsetof(BasicContext, mId), ExprValue::STRING);
+   registerField<BasicContext>("if", offsetof(BasicContext, mConditional), ExprValue::STRING);
+   registerField<BasicContext>("inputs", offsetof(BasicContext, mInputs), ExprValue::OBJECT);
+   registerField<BasicContext>("outputs", offsetof(BasicContext, mOutputs), ExprValue::OBJECT);
+   registerField<BasicContext>("env", offsetof(BasicContext, mEnv), ExprValue::OBJECT);
+   registerField<BasicContext>("timeout-minutes", offsetof(BasicContext, mTimeoutMinutes), ExprValue::NUMBER);
+   registerField<BasicContext>("continue-on-error", offsetof(BasicContext, mContinueOnError), ExprValue::BOOLEAN);
+}
+
+struct ContainerContext;
+struct StrategyContext;
+struct ServicesContext;
+struct PermissionsContext;
+
+struct JobContext : public BasicContext
+{
+   typedef BasicContext Parent;
+   
+   ExprValue mContainer;
+   ExprValue mStrategy;
+   ExprValue mServices;
+   ExprValue mPermissions;
+   ExprValue mDefaults;
+   ExprValue mSteps;
+   
+   ExprValue mNeeds;
+   ExprValue mRunsOn;
+   ExprValue mConcurrencyGroup;
+   
+   JobContext(ExprState* state);
+   std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<JobContext>(); }
+};
+
+template<> void ExprFieldObject::registerFieldsForType<JobContext>()
+{
+   auto& parentReg = getFieldRegistry<JobContext::Parent>();
+   getFieldRegistry<JobContext>().insert(parentReg.begin(), parentReg.end());
+   registerField<JobContext>("container", offsetof(JobContext, mContainer), ExprValue::OBJECT);
+   registerField<JobContext>("strategy", offsetof(JobContext, mStrategy), ExprValue::STRING);
+   registerField<JobContext>("services", offsetof(JobContext, mServices), ExprValue::OBJECT);
+   registerField<JobContext>("permissions", offsetof(JobContext, mPermissions), ExprValue::OBJECT);
+   registerField<JobContext>("defaults", offsetof(JobContext, mDefaults), ExprValue::OBJECT);
+   registerField<JobContext>("steps", offsetof(JobContext, mSteps), ExprValue::OBJECT, false);
+   registerField<JobContext>("needs", offsetof(JobContext, mNeeds), ExprValue::OBJECT);
+   registerField<JobContext>("runs-on", offsetof(JobContext, mRunsOn), ExprValue::STRING);
+   registerField<JobContext>("concurrency-group", offsetof(JobContext, mConcurrencyGroup), ExprValue::STRING);
+}
+
+struct JobStep : public BasicContext
+{
+   typedef BasicContext Parent;
+   
+   ExprValue mRun;
+   ExprValue mShell;
+   ExprValue mCwd;
+   
+   JobStep(ExprState* state) : BasicContext(state)
+   {
    }
    
    virtual ~JobStep() = default;
    
-   static void addKeysFromMap(std::vector<JobKV>& kvs, const fkyaml::node::mapping_type& yaml_map)
+   virtual runner::v1::Result execute(TaskTracker* tracker)
    {
-      for (auto itr = yaml_map.begin(), itrEnd = yaml_map.end(); itr != itrEnd; itr++)
-      {
-         JobKV kv;
-         kv.key = itr->first.as_str();
-         kv.value = itr->second.as_str();
-         kvs.emplace_back(kv);
-      }
-   }
-   
-   virtual void fromYAML(const fkyaml::node::mapping_type& yaml_map)
-   {
-      auto itr = yaml_map.find("name");
-      if (itr != yaml_map.end())
-      {
-         mName = itr->second.as_str();
-      }
-      itr = yaml_map.find("id");
-      if (itr != yaml_map.end())
-      {
-         mId = itr->second.as_str();
-      }
-      itr = yaml_map.find("if");
-      if (itr != yaml_map.end())
-      {
-         mConditional = itr->second.as_str();
-      }
-      itr = yaml_map.find("timeout-minutes");
-      if (itr != yaml_map.end())
-      {
-         mTimeoutMinutes = (int)itr->second.as_int();
-      }
-      itr = yaml_map.find("continue-on-error");
-      if (itr != yaml_map.end())
-      {
-         mContinueOnError = itr->second.as_bool();
-      }
-      itr = yaml_map.find("env");
-      if (itr != yaml_map.end())
-      {
-         addKeysFromMap(mEnv, itr->second.as_map());
-      }
-   }
-   
-   static void createFromYAML(std::vector<JobStep*>& outSteps, const fkyaml::node::mapping_type& yaml_map);
-   
-   virtual runner::v1::Result execute()=0;
-};
-
-struct UsesJobStep : public JobStep
-{
-   std::string mUses;
-   std::vector<JobKV> mWith;
-   
-   virtual void fromYAML(const fkyaml::node::mapping_type& yaml_map)
-   {
-      JobStep::fromYAML(yaml_map);
-      
-      auto itr = yaml_map.find("uses");
-      if (itr != yaml_map.end())
-      {
-         mUses = itr->second.as_str();
-      }
-      itr = yaml_map.find("with");
-      if (itr != yaml_map.end())
-      {
-         addKeysFromMap(mWith, itr->second.as_map());
-      }
-   }
-   
-   virtual runner::v1::Result execute()
-   {
-      printf("!! TODO: exec uses\n");
+      std::string cmdToRun = mState->substituteExpressions(mRun.getStringSafe());
+      char buffer[4096];
+      snprintf(buffer, sizeof(buffer), "TODO: run %s", cmdToRun.c_str());
+      tracker->log(buffer);
       return runner::v1::RESULT_SUCCESS;
    }
+   
+   std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<JobStep>(); }
 };
 
-struct RunJobStep : public JobStep
+template<> void ExprFieldObject::registerFieldsForType<JobStep>()
 {
-   std::string mCmd;
-   std::string mShell;
-   std::string mCwd;
+   auto& parentReg = getFieldRegistry<JobStep::Parent>();
+   getFieldRegistry<JobStep>().insert(parentReg.begin(), parentReg.end());
+   registerField<JobStep>("run", offsetof(JobStep, mRun), ExprValue::STRING);
+   registerField<JobStep>("shell", offsetof(JobStep, mShell), ExprValue::STRING);
+   registerField<JobStep>("cwd", offsetof(JobStep, mCwd), ExprValue::STRING);
+}
+
+
+SingleWorkflowContext::SingleWorkflowContext(ExprState* state) : ExprFieldObject(state)
+{
+   ExprMap* jobMap = new ExprMap(state);
+   jobMap->mAddObjectFunc = ExprArray::addTypedObjectFunc<JobContext>;
+   mJobs.setObject(jobMap);
+}
+
+JobContext::JobContext(ExprState* state) : BasicContext(state)
+{
+   ExprArray* jobArray = new ExprArray(state);
+   jobArray->mAddObjectFunc = ExprArray::addTypedObjectFunc<JobStep>;
+   mSteps = ExprValue().setObject(jobArray);
+}
+
+
+ExprValue YAMLToExpr(ExprState& state, ExprObject* baseObject, const fkyaml::node& node)
+{
+   ExprArray* baseArray = dynamic_cast<ExprArray*>(baseObject);
+   ExpressionEval::ExprMap* baseMap = dynamic_cast<ExpressionEval::ExprMap*>(baseObject);
    
-   virtual void fromYAML(const fkyaml::node::mapping_type& yaml_map)
+   ExprValue ret;
+   if (node.is_sequence() && (baseObject == NULL || baseArray))
    {
-      JobStep::fromYAML(yaml_map);
+      if (baseArray == NULL)
+      {
+         baseArray = new ExprArray(&state);
+      }
       
-      auto itr = yaml_map.find("run");
-      if (itr != yaml_map.end())
+      for (auto& itr : node.as_seq())
       {
-         mCmd = itr->second.as_str();
+         ExprValue val = YAMLToExpr(state, NULL, itr);
+         baseArray->mItems.push_back(val);
       }
-      itr = yaml_map.find("shell");
-      if (itr != yaml_map.end())
+      
+      ret.setObject(baseArray);
+   }
+   else if (node.is_mapping() && (baseObject == NULL || baseMap))
+   {
+      if (baseMap == NULL)
       {
-         mShell = itr->second.as_str();
+         baseMap = new ExpressionEval::ExprMap(&state);
       }
-      itr = yaml_map.find("working-directory");
-      if (itr != yaml_map.end())
+      
+      for (auto& itr : node.as_map())
       {
-         mCwd = itr->second.as_str();
+         ExprValue val = YAMLToExpr(state, NULL, itr.second);
+         baseMap->mItems[itr.first.as_str()] = val;
       }
+      
+      ret.setObject(baseMap);
+   }
+   else if (node.is_float_number())
+   {
+      ret.setNumeric(node.as_float());
+   }
+   else if (node.is_boolean())
+   {
+      ret.setBool(node.as_bool());
+   }
+   else if (node.is_string())
+   {
+      ret.setString(*state.mStringTable, node.as_str().c_str());
    }
    
-   virtual runner::v1::Result execute()
-   {
-      printf("!! TODO: exec run\n");
-      return runner::v1::RESULT_SUCCESS;
-   }
-};
+   return ret;
+}
 
-void JobStep::createFromYAML(std::vector<JobStep*>& outSteps, const fkyaml::node::mapping_type& yaml_map)
+
+// input: obj: root node object
+// input: yaml_map root node of serialized ExprFieldObject
+void YAMLToExprField(ExprState& state,
+                     ExprFieldObject* obj,
+                     const fkyaml::node::mapping_type& yaml_map)
 {
-   if (yaml_map.find("uses") != yaml_map.end())
+   auto& registry = obj->getObjectFieldRegistry();
+   for (auto field : registry)
    {
-      UsesJobStep* step = new UsesJobStep();
-      outSteps.push_back(step);
-      step->fromYAML(yaml_map);
+      std::string key = field.second.baseName;
+      auto itr = yaml_map.find(key);
+      
+      if (itr != yaml_map.end())
+      {
+         if (!field.second.canSet)
+         {
+            // Grab object under key
+            ExprObject* inst = obj->getMapKey(key).getObject();
+            if (inst == NULL)
+            {
+               continue;
+            }
+            
+            // Key is a map, field is a field object -> set the fields
+            ExprFieldObject* exprObj = dynamic_cast<ExprFieldObject*>(inst);
+            if (exprObj && itr->second.is_mapping())
+            {
+               YAMLToExprField(state, exprObj, itr->second.as_map());
+               continue;
+            }
+            
+            // Key is an array, field is an array
+            ExprArray* exprArray = dynamic_cast<ExprArray*>(inst);
+            if (exprArray && itr->second.is_sequence())
+            {
+               exprArray->clear();
+               for (auto arrayItr : itr->second.as_seq())
+               {
+                  // Additional consideration: Array might have a constructor for its items
+                  ExprObject* arrayItem = exprArray->constructObject();
+                  ExprValue arrayItemValue;
+                  if (arrayItem)
+                  {
+                     ExprFieldObject* fieldArrayItem = dynamic_cast<ExprFieldObject*>(arrayItem);
+                     if (fieldArrayItem)
+                     {
+                        YAMLToExprField(state, fieldArrayItem, arrayItr.as_map());
+                     }
+                     else
+                     {
+                        YAMLToExpr(state, arrayItem, arrayItr);
+                     }
+                     arrayItemValue.setObject(fieldArrayItem);
+                  }
+                  else
+                  {
+                     arrayItemValue = YAMLToExpr(state, NULL, itr->second);
+                  }
+                  exprArray->addArrayValue(arrayItemValue);
+               }
+               continue;
+            }
+            
+            // Key is a map, field is a map
+            ExprMap* exprMap = dynamic_cast<ExprMap*>(inst);
+            if (exprMap && itr->second.is_mapping())
+            {
+               exprMap->clear();
+               for (auto mapItr : itr->second.as_map())
+               {
+                  // Additional consideration: Array might have a constructor for its items
+                  ExprObject* mapItem = exprMap->constructObject();
+                  ExprValue mapItemValue;
+                  if (mapItem)
+                  {
+                     ExprFieldObject* fieldMapItem = dynamic_cast<ExprFieldObject*>(mapItem);
+                     if (fieldMapItem)
+                     {
+                        YAMLToExprField(state, fieldMapItem, mapItr.second.as_map());
+                     }
+                     else
+                     {
+                        YAMLToExpr(state, mapItem, mapItr);
+                     }
+                     mapItemValue.setObject(fieldMapItem);
+                  }
+                  else
+                  {
+                     mapItemValue = YAMLToExpr(state, NULL, mapItr.second);
+                  }
+                  exprMap->setMapKey(mapItr.first.as_str(), mapItemValue);
+               }
+            }
+            
+            // Out of options
+         }
+         else
+         {
+            // Directly replace the key
+            obj->setMapKey(key, YAMLToExpr(state, NULL, itr->second));
+        }
+      }
+      
    }
-   else if (yaml_map.find("run") != yaml_map.end())
+}
+
+ExprMap* ProtoKVToObject(ExprState& state, const ::google::protobuf::Map<std::string, std::string>& map)
+{
+   ExprMap* outMap = new ExprMap(&state);
+   for (auto& kv: map)
    {
-      RunJobStep* step = new RunJobStep();
-      outSteps.push_back(step);
-      step->fromYAML(yaml_map);
+      outMap->setMapKey(kv.first, ExprValue().setString(*state.mStringTable, kv.second.c_str()));
    }
+   return outMap;
+}
+
+ExprMap* ProtoStructToObject(ExprState& state, const ::google::protobuf::Struct& map);
+
+ExprValue ProtoValueToExprValue(ExprState& state, const ::google::protobuf::Value& value)
+{
+   ExprValue outValue;
+   
+   switch (value.kind_case()) {
+      case google::protobuf::Value::kNullValue:
+         break;
+      case google::protobuf::Value::kNumberValue:
+         outValue.setNumeric(value.number_value());
+         break;
+      case google::protobuf::Value::kStringValue:
+         outValue.setString(*state.mStringTable, value.string_value().c_str());
+         break;
+      case google::protobuf::Value::kBoolValue:
+         outValue.setBool(value.bool_value());
+         break;
+      case google::protobuf::Value::kStructValue:
+         outValue.setObject(ProtoStructToObject(state, value.struct_value()));
+         break;
+      case google::protobuf::Value::kListValue:
+      {
+         ExprArray* arrayObject = new ExprArray(&state);
+         for (int i = 0; i < value.list_value().values_size(); ++i)
+         {
+            arrayObject->addArrayValue(ProtoValueToExprValue(state, value.list_value().values(i)));
+         }
+         outValue.setObject(arrayObject);
+      }
+      default:
+         break;
+   }
+   
+   return outValue;
+}
+
+ExprMap* ProtoStructToObject(ExprState& state, const ::google::protobuf::Struct& map)
+{
+   ExprMap* outMap = new ExprMap(&state);
+   
+   for (const auto& field : map.fields())
+   {
+       const std::string& key = field.first;
+       const google::protobuf::Value& value = field.second;
+       outMap->setMapKey(key, ProtoValueToExprValue(state, value));
+   }
+   
+   return outMap;
 }
 
 // Polls for a task on the server
@@ -771,65 +1058,121 @@ TaskTracker* PollForTask(CURL* curl, RunnerState& state)
          {
             return NULL;
          }
+         
+         ExprState* exprState = new ExprState();
+         
+         exprState->mStringTable = new ExpressionEval::StringTable();
+         SingleWorkflowContext* workFlowContext = new SingleWorkflowContext(exprState);
 
          try
          {
             auto node = fkyaml::node::deserialize(rspTask.task().workflow_payload());
-            auto jobList = node["jobs"].as_map();
-
-            if (!jobList.empty())
+            if (!node.is_mapping())
             {
-               auto jobInfo = jobList.begin()->second.as_map();
-               if (!jobInfo["steps"].is_null())
-               {
-                  auto jobSteps = jobInfo["steps"].as_seq();
-                  size_t numSteps = jobSteps.size();
-                  
-                  for (const auto& step : jobSteps)
-                  {
-                     JobStep::createFromYAML(steps, step.as_map());
-                  }
-               }
+               throw std::runtime_error("YAML isn't a map");
+            }
+            
+            YAMLToExprField(*exprState, workFlowContext, node.as_map());
+            
+            std::vector<std::string> jobList;
+            workFlowContext->mJobs.getObject()->extractKeys(jobList);
+            if (jobList.size() == 0)
+            {
+               throw std::runtime_error("No jobs defined in workflow");
+            }
+            else if (jobList.size() > 1)
+            {
+               throw std::runtime_error("More than one job defined in workflow");
             }
             
          }
          catch (const std::exception& e)
          {
-            // Cleanup steps
-            for (JobStep* step : steps)
-            {
-               delete step;
-            }
+            // Cleanup
+            delete exprState;
             return NULL;
          }
 
-         tracker = new TaskTracker(rspTask.task(), steps);
+         tracker = new TaskTracker(rspTask.task(), exprState, workFlowContext);
       }
    }
    
    return tracker;
 }
 
+template<class T> void getTypedObjectsFromArray(ExprArray* arr, std::vector<T*>& outList)
+{
+   if (arr == NULL)
+   {
+      return;
+   }
+   for (ExprValue val : arr->mItems)
+   {
+      if (val.isObject())
+      {
+         T* obj = dynamic_cast<T*>(val.getObject());
+         if (obj)
+         {
+            outList.push_back(obj);
+         }
+      }
+   }
+}
+
 // Example thread to send dummy updates to the server
 void PerformTask(TaskTracker* currentTask)
 {
    char buffer[512];
+   
+   std::vector<std::string> jobList;
+   currentTask->mWorkflow->mJobs.getObject()->extractKeys(jobList);
+   
+   std::string jobName = jobList[0];
+   JobContext* jobContext = currentTask->mWorkflow->mJobs.asObject<ExprMap>()->getMapKey(jobName).asObject<JobContext>();
+   
+   ExprMultiKey* env = new ExprMultiKey(currentTask->mExprState);
+   env->mSlots[0] = currentTask->mWorkflow->mEnv.getObject();
+   env->mSlots[1] = jobContext->mEnv.getObject();
+   
+   // Setup context for job
+   ExprState* exprState = currentTask->mExprState;
+   exprState->setContext("github", ProtoStructToObject(*exprState, currentTask->mTask.context()));
+   exprState->setContext("env", env);
+   exprState->setContext("vars", ProtoKVToObject(*exprState, currentTask->mTask.vars()));
+   exprState->setContext("job", jobContext);
+   exprState->setContext("jobs", currentTask->mWorkflow->mJobs.getObject());
+   exprState->setContext("steps", jobContext->mSteps.getObject());
+   exprState->setContext("runner", new ExprMap(exprState));
+   exprState->setContext("secrets", ProtoKVToObject(*exprState, currentTask->mTask.secrets()));
+   exprState->setContext("strategy", new ExprMap(exprState));
+   exprState->setContext("matrix", new ExprMap(exprState));
+   exprState->setContext("needs", new ExprMap(exprState));
+   exprState->setContext("input", new ExprMap(exprState));
+   
+   std::vector<JobStep*> steps;
+   getTypedObjectsFromArray<JobStep>(jobContext->mSteps.asObject<ExprArray>(), steps);
+   
    currentTask->beginJob();
-   snprintf(buffer, sizeof(buffer), "Performing %i tasks...", currentTask->mSteps.size());
+   snprintf(buffer, sizeof(buffer), "Performing %i tasks for job %s...", steps.size(), jobName.c_str());
    currentTask->log(buffer);
   
-   //
+   //getTypedObjectsFromArray
    uint32_t stepCount = 0;
    runner::v1::Result jobResult = runner::v1::RESULT_SUCCESS;
    
-   for (JobStep* step : currentTask->mSteps)
+   for (JobStep* step : steps)
    {
+      // Update context for step
+      env->mSlots[2] = step->mEnv.getObject();
+      
+      //
       currentTask->beginStep(stepCount);
       snprintf(buffer, sizeof(buffer), "Doing something in step %u...", stepCount);
       currentTask->log(buffer);
-      runner::v1::Result result = step->execute();
+      runner::v1::Result result = step->execute(currentTask);
       
-      if (!(result == runner::v1::RESULT_SUCCESS || result == runner::v1::RESULT_SKIPPED) && !step->mContinueOnError)
+      if (!(result == runner::v1::RESULT_SUCCESS || result == runner::v1::RESULT_SKIPPED) &&
+          !step->mContinueOnError.getBool())
       {
          jobResult = result;
          currentTask->endStep(result);
@@ -850,6 +1193,8 @@ void PerformTask(TaskTracker* currentTask)
    currentTask->setFinished();
 }
 
+std::unordered_map<std::string, FuncInfo> ExprState::smFunctions;
+
 // Entrypoint
 int main(int argc, char** argv)
 {
@@ -859,6 +1204,11 @@ int main(int argc, char** argv)
       printf("Failed to initialize CURL\n");
       return 1;
    }
+   
+   ExprFieldObject::registerFieldsForType<BasicContext>();
+   ExprFieldObject::registerFieldsForType<JobContext>();
+   ExprFieldObject::registerFieldsForType<JobStep>();
+   ExprFieldObject::registerFieldsForType<SingleWorkflowContext>();
    
    RunnerState state;
    state.tasks_version = 0;

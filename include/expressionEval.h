@@ -5,8 +5,13 @@
 #include <vector>
 #include <memory>
 #include <cctype>
+#include <cstddef>
 #include <utility>
 #include <string.h>
+#include <stdint.h>
+#include <unordered_set>
+#include <google/protobuf/util/json_util.h>
+#include <fkYAML/node.hpp>
 
 namespace ExpressionEval
 {
@@ -15,6 +20,7 @@ struct ExprObject;
 struct ExprState;
 struct ExprValue;
 struct ExprNode;
+class StringTable;
 
 enum class TokenType
 {
@@ -45,36 +51,84 @@ struct FuncInfo
    FuncPtr mPtr;
 };
 
+class StringTable
+{
+public:
+   const char* intern(const char* str)
+   {
+       auto it = table.insert(str).first;
+       return it->c_str();
+   }
+
+private:
+   std::unordered_set<std::string> table;
+};
+
 // Duck typed value
 struct ExprValue
 {
-   std::string value;
-   int64_t numValue;
-   bool isNumeric;
-   ExprObject* objectInstance;
+   enum Tag : uint64_t
+   {
+      TAG_SHIFT = 50,
+      NUMBER = 0x0ULL << TAG_SHIFT,
+      BOOLEAN = 0x1ULL << TAG_SHIFT,
+      STRING = 0x2ULL << TAG_SHIFT,
+      OBJECT = 0x3ULL << TAG_SHIFT,
+      PAYLOAD_MASK = 0x0003FFFFFFFFFFFFULL,
+      NAN_MASK = 0x7FF0000000000000ULL,
+      TAG_MASK = 0x3ULL << TAG_SHIFT
+   };
+   
+   inline bool isNull() const { return ((value & (NAN_MASK | OBJECT)) != 0) ? (getObject() != NULL) : false; }
+
+   uint64_t value;
    
    ExprValue();
    
-   void setBool(bool val);
-   void setNumeric(int64_t val);
-   void setString(const char* str);
-   void setObject(ExprObject* obj);
+   ExprValue& setBool(bool val);
+   ExprValue& setNumeric(float64_t val);
+   ExprValue& setString(StringTable& st, const char* str);
+   ExprValue& setObject(ExprObject* obj);
+   
+   ExprObject* getObject() const;
+   template<class T> T* asObject() { return dynamic_cast<T*>(getObject()); }
+   bool getBool() const;
+   float64_t getNumber() const;
+   const char* getString() const;
+   const char* getStringSafe() const;
+   
+   inline bool isNumber() const { return (value & NAN_MASK) == 0; }
+   inline bool isBool() const { return !isNumber() && (value & TAG_MASK) == BOOLEAN; }
+   inline bool isString() const { return !isNumber() && (value & TAG_MASK) == STRING; }
+   inline bool isObject() const { return !isNumber() && (value & TAG_MASK) == OBJECT; }
+   
+   const char* coerceString(StringTable& st) const;
+   
    bool testEq(const ExprValue& other) const;
 };
 
 // Runtime state
 struct ExprState
 {
+   enum
+   {
+      MaxStackDepth = 3
+   };
+   
+   StringTable* mStringTable;
    std::vector<ExprObject*> mObjects;
    std::unordered_map<std::string, ExprObject*> mContexts;
    static std::unordered_map<std::string, FuncInfo> smFunctions;
    ExprValue mValue;
+   int8_t mDepth;
    
-   void addObject(ExprObject* obj);
+   ExprObject* addObject(ExprObject* obj);
    ExprValue callFunction(const char* name, int argc, ExprValue* args);
    ExprValue evaluate(ExprNode* root);
    void setContext(const char* name, ExprObject* obj);
    ExprObject* getContext(const char* name);
+   std::string substituteExpressions(const std::string &input, int8_t depth=MaxStackDepth);
+   ExprValue evaluateString(const std::string &input);
    
    ExprState();
    ~ExprState();
@@ -86,12 +140,28 @@ struct ExprState
 // Wrapper for an object, typically a map iterator
 struct ExprObject
 {
+   typedef ExprObject* (*AddObjectFuncPtr)(ExprState*);
+   ExprState* mState;
+   AddObjectFuncPtr mAddObjectFunc;
+   
+   ExprObject(ExprState* state);
    virtual ~ExprObject();
+   
+   virtual void clear() = 0;
+   inline ExprObject* constructObject();
+   virtual void addArrayValue(ExprValue value) = 0;
    virtual ExprValue getArrayIndex(uint32_t index) = 0;
    virtual ExprValue getMapKey(std::string key) = 0;
+   virtual ExprValue setMapKey(std::string key, ExprValue value) = 0;
    virtual void toList(std::vector<ExprValue>& outItems) = 0;
+   virtual void extractKeys(std::vector<std::string>& outKeys) = 0;
    virtual std::string toString() = 0;
    virtual void getExpandRoots(std::vector<ExprObject*>& outItems) = 0;
+   
+   template<typename T> static ExprObject* addTypedObjectFunc(ExprState* state)
+   {
+      return new T(state);
+   }
 };
 
 // Array object (for *)
@@ -99,12 +169,102 @@ struct ExprArray : public ExprObject
 {
    std::vector<ExprValue> mItems;
    
+   ExprArray(ExprState* state);
+   
+   virtual void clear();
+   virtual void addArrayValue(ExprValue value);
    virtual ExprValue getArrayIndex(uint32_t index);
    virtual ExprValue getMapKey(std::string key);
+   virtual ExprValue setMapKey(std::string key, ExprValue value);
    virtual void toList(std::vector<ExprValue>& outItems);
+   virtual void extractKeys(std::vector<std::string>& outKeys);
    virtual void getExpandRoots(std::vector<ExprObject*>& outItems);
    virtual std::string toString();
 };
+
+// Generic map object
+struct ExprMap : public ExprObject
+{
+   std::unordered_map<std::string, ExprValue> mItems;
+   
+   ExprMap(ExprState* state);
+   virtual void clear();
+   virtual void addArrayValue(ExprValue value);
+   virtual ExprValue getArrayIndex(uint32_t index);
+   virtual ExprValue getMapKey(std::string key);
+   virtual ExprValue setMapKey(std::string key, ExprValue value);
+   virtual void toList(std::vector<ExprValue>& outItems);
+   virtual void extractKeys(std::vector<std::string>& outKeys);
+   virtual void getExpandRoots(std::vector<ExprObject*>& outItems);
+   virtual std::string toString();
+};
+
+struct ExprMultiKey : public ExprObject
+{
+   ExprObject* mSlots[3];
+   
+   ExprMultiKey(ExprState* state);
+   virtual ~ExprMultiKey();
+   
+   virtual void clear();
+   inline ExprObject* constructObject();
+   virtual void addArrayValue(ExprValue value);
+   virtual ExprValue getArrayIndex(uint32_t index);
+   virtual ExprValue getMapKey(std::string key);
+   virtual ExprValue setMapKey(std::string key, ExprValue value);
+   virtual void toList(std::vector<ExprValue>& outItems);
+   virtual void extractKeys(std::vector<std::string>& outKeys);
+   virtual std::string toString();
+   virtual void getExpandRoots(std::vector<ExprObject*>& outItems);
+};
+
+// Map object with fixed fields
+struct ExprFieldObject : public ExprObject
+{
+   struct FieldRef
+   {
+      const char* baseName;
+      uintptr_t offset;
+      uint64_t typeMask;
+      bool canSet;
+   };
+   
+   template<class T> static std::unordered_map<std::string, FieldRef>& getFieldRegistry()
+   {
+      static std::unordered_map<std::string, FieldRef> reg;
+      return reg;
+   }
+   
+   std::unordered_map<std::string, FieldRef> mItems;
+   
+   ExprFieldObject(ExprState* state);
+   
+   virtual void clear();
+   virtual void addArrayValue(ExprValue value);
+   virtual ExprValue getArrayIndex(uint32_t index);
+   virtual ExprValue getMapKey(std::string key);
+   virtual ExprValue setMapKey(std::string key, ExprValue value);
+   virtual void toList(std::vector<ExprValue>& outItems);
+   virtual void extractKeys(std::vector<std::string>& outKeys);
+   virtual void getExpandRoots(std::vector<ExprObject*>& outItems);
+   virtual std::string toString();
+   virtual std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() { return getFieldRegistry<ExprObject>(); }
+   
+   template<class T> static void registerFieldsForType();
+   
+   template <class T>
+   static void registerField(const char* name, uintptr_t offset, uint64_t typeMask, bool canSet=true)
+   {
+      auto& fields = getFieldRegistry<T>();
+      if ((typeMask & ExprValue::TAG_MASK) != 0)
+      {
+         typeMask |= ExprValue::NAN_MASK;
+      }
+      fields[std::string(name)] = { name, offset, typeMask, canSet };
+   }
+};
+
+
 
 // AST node
 struct ExprNode
@@ -219,8 +379,9 @@ class Parser
    std::vector<Token> mTokens;
    size_t mCurrent;
    CompiledStatement* mOutput;
-   
 public:
+   StringTable* mStringTable;
+   
    Parser(std::vector<Token> tokens);
    
    int getPrecedence(TokenType op);
@@ -405,52 +566,136 @@ inline bool tokenize(const std::string &expression, std::vector<Token>& tokens)
    return true;
 }
 
-inline ExprValue::ExprValue() : value(""), numValue(0), isNumeric(true), objectInstance(NULL)
+inline const char* StringTable::intern(const char* str)
+{
+      auto it = table.insert(str).first;
+      return it->c_str();
+}
+
+inline ExprValue::ExprValue() : value(ExprValue::NAN_MASK | ExprValue::OBJECT)
 {
 }
 
-inline void ExprValue::setBool(bool val)
+inline ExprValue& ExprValue::setBool(bool val)
 {
-   value = val ? "1" : "0";
-   numValue = (int64_t)val;
-   isNumeric = true;
-   objectInstance = NULL;
+   value = ExprValue::NAN_MASK | ExprValue::BOOLEAN | (uint64_t)val;
+   return *this;
 }
 
-inline void ExprValue::setNumeric(int64_t val)
+inline ExprValue& ExprValue::setNumeric(float64_t val)
 {
-   value = std::to_string(val);
-   numValue = (int64_t)val;
-   isNumeric = true;
-   objectInstance = NULL;
+   value = ExprValue::NUMBER | (((uint64_t)(uintptr_t)val) & PAYLOAD_MASK);
+   return *this;
 }
 
-inline void ExprValue::setString(const char* str)
+inline ExprValue& ExprValue::setString(StringTable& st, const char* str)
 {
-   value = str;
-   isNumeric = exprStringToI64(str, numValue);
-   objectInstance = NULL;
+   const char *strVal = st.intern(str);
+   value = ExprValue::NAN_MASK | ExprValue::STRING | ((uint64_t)(uintptr_t)strVal & PAYLOAD_MASK);
+   return *this;
 }
 
-inline void ExprValue::setObject(ExprObject* obj)
+inline ExprValue& ExprValue::setObject(ExprObject* obj)
 {
-   setString(obj->toString().c_str());
-   objectInstance = obj;
+   value = ExprValue::NAN_MASK | ExprValue::OBJECT | ((uint64_t)(uintptr_t)obj & PAYLOAD_MASK);
+   return *this;
+}
+
+inline ExprObject* ExprValue::getObject() const
+{
+   const uint64_t checkVal = (ExprValue::NAN_MASK | ExprValue::OBJECT);
+   if ((value & checkVal) == checkVal)
+      return (ExprObject*)(value & ExprValue::PAYLOAD_MASK);
+   else
+      return NULL;
+}
+
+inline bool ExprValue::getBool() const
+{
+   const uint64_t checkVal = (ExprValue::NAN_MASK | ExprValue::BOOLEAN);
+   return ((value & checkVal) == checkVal) ? (uint64_t)(value & ExprValue::PAYLOAD_MASK) != 0 : false;
+}
+
+inline float64_t ExprValue::getNumber() const
+{
+   if ((value & ExprValue::STRING) != 0)
+   {
+      return std::stold(getString());
+   }
+   else if ((value & ExprValue::BOOLEAN) != 0)
+   {
+      return getBool() ? 1.0 : 0.0;
+   }
+   else if ((value & ExprValue::OBJECT) != 0)
+   {
+      return getObject() ? std::numeric_limits<float64_t>::quiet_NaN() : 0.0;
+   }
+   else
+   {
+      return (float64_t)(value & ExprValue::PAYLOAD_MASK);
+   }
+}
+
+inline const char* ExprValue::getString() const
+{
+   const uint64_t checkVal = (ExprValue::NAN_MASK | ExprValue::STRING);
+   return ((value & checkVal) == checkVal) ? (const char*)(value & ExprValue::PAYLOAD_MASK) : NULL;
+}
+
+inline const char* ExprValue::getStringSafe() const
+{
+   const char* ret = getString();
+   return ret ? ret : "";
+}
+
+
+const char* ExprValue::coerceString(StringTable& st) const
+{
+   if (isString())
+   {
+      return getString();
+   }
+   else if (isBool())
+   {
+      return getBool() ? "true" : "false";
+   }
+   else if (isObject())
+   {
+      return getObject() ? "NaN" : "null";
+   }
+   else
+   {
+      return st.intern(std::to_string(getNumber()).c_str());
+   }
 }
 
 inline bool ExprValue::testEq(const ExprValue& other) const
 {
-   if (isNumeric || other.isNumeric)
+   if ((value & (ExprValue::TAG_MASK | ExprValue::NAN_MASK)) == (other.value & (ExprValue::TAG_MASK | ExprValue::NAN_MASK)))
    {
-      return numValue == other.numValue;
+      switch (value & ExprValue::TAG_MASK)
+      {
+         case ExprValue::BOOLEAN:
+            return getBool() == other.getBool();
+         case ExprValue::NUMBER:
+            return getNumber() == other.getNumber();
+         case ExprValue::STRING:
+            return strcasecmp(getString(), other.getString()) == 0;
+         case ExprValue::OBJECT:
+            return getObject() == other.getObject();
+         default:
+            return false;
+      }
    }
    else
    {
-      return strcasecmp(value.c_str(), other.value.c_str()) == 0;
+      const float64_t v1 = getNumber();
+      const float64_t v2 = other.getNumber();
+      return (std::isnan(v1) || std::isnan(v2)) ? false : (v1 == v2);
    }
 }
 
-inline ExprState::ExprState()
+inline ExprState::ExprState() : mDepth(0), mStringTable(NULL)
 {
 }
 
@@ -459,9 +704,10 @@ inline ExprState::~ExprState()
    clear();
 }
 
-inline void ExprState::addObject(ExprObject* obj)
+inline ExprObject* ExprState::addObject(ExprObject* obj)
 {
    mObjects.push_back(obj);
+   return obj;
 }
 
 inline ExprValue ExprState::callFunction(const char* name, int argc, ExprValue* args)
@@ -503,8 +749,106 @@ inline void ExprState::clear()
    mObjects.clear();
 }
 
+std::string ExprState::substituteExpressions(const std::string &input, int8_t depth)
+{
+    std::string output;
+    size_t pos = 0;
+
+    while (pos < input.length())
+    {
+        size_t start = input.find("${{", pos);
+        if (start == std::string::npos)
+        {
+            output += input.substr(pos);
+            break;
+        }
+
+        output += input.substr(pos, start - pos);
+
+        size_t end = input.find("}}", start);
+        if (end == std::string::npos)
+        {
+            output += input.substr(start);
+            break;
+        }
+
+        std::string expression = input.substr(start + 3, end - (start + 3));
+        const char* value = evaluateString(expression).getStringSafe();
+       
+        if (strstr(value, "${{") != NULL)
+        {
+           if (depth == 0)
+           {
+              throw std::runtime_error("Max expression stack depth reached");
+           }
+           output += substituteExpressions(value, depth--);
+        }
+        else
+        {
+           output += value;
+        }
+
+        pos = end + 2;
+    }
+
+    return output;
+}
+
+ExprValue ExprState::evaluateString(const std::string &input)
+{
+   if (mDepth > MaxStackDepth)
+   {
+      throw std::runtime_error("Stack overflow");
+   }
+   mDepth++;
+   printf("DEBUG: evaluating string %s\n", input.c_str());
+
+   // Tokenize
+   std::vector<Token> tokens;
+   tokenize(input, tokens);
+   // Parse
+   Parser parser(tokens);
+   parser.mStringTable = mStringTable;
+   // Compile
+   CompiledStatement* stmts = parser.compile();
+   // Evaluate
+   ExprValue result = evaluate(stmts->mRoot);
+   delete stmts;
+   mDepth--;
+
+   return result;
+}
+
+inline ExprObject::ExprObject(ExprState* state) : mState(state), mAddObjectFunc(NULL)
+{
+   if (state) 
+   {
+      state->addObject(this);
+   }
+}
+
 inline ExprObject::~ExprObject()
 {
+}
+
+inline ExprObject* ExprObject::constructObject()
+{
+   return mAddObjectFunc ? mAddObjectFunc(mState) : NULL;
+}
+
+
+ExprArray::ExprArray(ExprState* state) : ExprObject(state)
+{
+}
+
+inline void  ExprArray::clear()
+{
+   mItems.clear();
+}
+
+inline void ExprArray::addArrayValue(ExprValue value)
+{
+   mItems.push_back(value);
 }
 
 inline ExprValue ExprArray::getArrayIndex(uint32_t index)
@@ -517,18 +861,29 @@ inline ExprValue ExprArray::getMapKey(std::string key)
   return ExprValue();
 }
 
+inline ExprValue ExprArray::setMapKey(std::string key, ExprValue value)
+{
+   return value;
+}
+
 inline void ExprArray::toList(std::vector<ExprValue>& outItems)
 {
   outItems = mItems;
+}
+
+inline void ExprArray::extractKeys(std::vector<std::string>& outItems)
+{
+   outItems.clear();
 }
 
 inline void ExprArray::getExpandRoots(std::vector<ExprObject*>& outItems)
 {
   for (ExprValue& value : mItems)
   {
-     if (value.objectInstance)
+     ExprObject* obj = value.getObject();
+     if (obj)
      {
-        outItems.push_back(value.objectInstance);
+        outItems.push_back(obj);
      }
   }
 }
@@ -547,6 +902,236 @@ inline std::string ExprArray::toString()
   return outS;
 }
 
+
+ExprMap::ExprMap(ExprState* state) : ExprObject(state)
+{
+
+}
+
+inline void  ExprMap::clear()
+{
+   mItems.clear();
+}
+
+inline void ExprMap::addArrayValue(ExprValue value)
+{
+}
+
+inline ExprValue ExprMap::getArrayIndex(uint32_t index)
+{
+   return ExprValue();
+}
+
+inline ExprValue ExprMap::getMapKey(std::string key)
+{
+   auto itr = mItems.find(key);
+   if (itr == mItems.end())
+   {
+      return ExprValue();
+   }
+   else
+   {
+      return mItems[key];
+   }
+}
+
+inline ExprValue ExprMap::setMapKey(std::string key, ExprValue value)
+{
+   mItems[key] = value;
+   return value;
+}
+
+inline void ExprMap::toList(std::vector<ExprValue>& outItems)
+{
+  outItems.clear();
+}
+
+inline void ExprMap::extractKeys(std::vector<std::string>& outItems)
+{
+   outItems.clear();
+   for (const auto& itr : mItems)
+   {
+      outItems.push_back(itr.first);
+   }
+}
+
+inline void ExprMap::getExpandRoots(std::vector<ExprObject*>& outItems)
+{
+  for (auto& itr : mItems)
+  {
+     ExprObject* obj = itr.second.getObject();
+     if (obj)
+     {
+        outItems.push_back(obj);
+     }
+  }
+}
+
+inline std::string ExprMap::toString()
+{
+   return "";
+}
+
+
+ExprMultiKey::ExprMultiKey(ExprState* state) : ExprObject(state)
+{
+   mSlots[0] = NULL;
+   mSlots[1] = NULL;
+   mSlots[2] = NULL;
+}
+
+inline ExprMultiKey::~ExprMultiKey()
+{
+}
+
+inline void ExprMultiKey::clear()
+{
+}
+
+inline ExprObject* ExprMultiKey::constructObject()
+{
+   return NULL;
+}
+
+inline void ExprMultiKey::addArrayValue(ExprValue value)
+{
+}
+
+inline ExprValue ExprMultiKey::getArrayIndex(uint32_t index)
+{
+   return ExprValue();
+}
+
+inline ExprValue ExprMultiKey::getMapKey(std::string key)
+{
+   for (int i=2; i>=0; i--)
+   {
+      if (mSlots[i] == NULL)
+      {
+         continue;
+      }
+      ExprValue value = mSlots[i]->getMapKey(key);
+      if (value.isObject() && value.getObject() == NULL)
+      {
+         continue;
+      }
+      return value;
+   }
+}
+
+inline ExprValue ExprMultiKey::setMapKey(std::string key, ExprValue value)
+{
+   return ExprValue();
+}
+
+inline void ExprMultiKey::toList(std::vector<ExprValue>& outItems)
+{
+   return ExprValue();
+}
+
+inline void ExprMultiKey::extractKeys(std::vector<std::string>& outKeys)
+{
+   std::set<std::string> keyList;
+   std::vector<std::string> newKeys;
+   
+   for (int i=2; i>=0; i--)
+   {
+      if (mSlots[i] == NULL)
+      {
+         continue;
+      }
+      
+      mSlots[i]->extractKeys(newKeys);
+      
+      for (std::string& key : newKeys)
+      {
+         keyList.insert(key);
+      }
+   }
+   
+   newKeys.clear();
+   for (const std::string& itr : keyList)
+   {
+      newKeys.push_back(itr);
+   }
+   
+   return newKeys;
+}
+
+inline std::string ExprMultiKey::toString()
+{
+   return "";
+}
+
+inline void ExprMultiKey::getExpandRoots(std::vector<ExprObject*>& outItems)
+{
+   outItems.clear();
+}
+
+
+ExprFieldObject::ExprFieldObject(ExprState* state) : ExprObject(state)
+{
+
+}
+
+inline void  ExprFieldObject::clear()
+{
+}
+
+inline void ExprFieldObject::addArrayValue(ExprValue value)
+{
+}
+
+inline ExprValue ExprFieldObject::getArrayIndex(uint32_t index)
+{
+   return ExprValue();
+}
+
+inline ExprValue ExprFieldObject::getMapKey(std::string key)
+{
+   auto& reg = getObjectFieldRegistry();
+   auto itr = reg.find(key);
+   if (itr != reg.end())
+   {
+      ExprValue* val = (ExprValue*)(((uint8_t*)this) + itr->second.offset);
+      return *val;
+   }
+   return ExprValue();
+}
+
+inline ExprValue ExprFieldObject::setMapKey(std::string key, ExprValue value)
+{
+   auto& reg = getObjectFieldRegistry();
+   auto itr = reg.find(key);
+   if (itr != reg.end() && 
+       ((itr->second.typeMask & value.value) == (value.value & ~ExprValue::PAYLOAD_MASK)) &&
+       itr->second.canSet)
+   {
+      ExprValue* val = (ExprValue*)(((uint8_t*)this) + itr->second.offset);
+      *val = value;
+   }
+   return value;
+}
+
+inline void ExprFieldObject::toList(std::vector<ExprValue>& outItems)
+{
+  outItems.clear();
+}
+
+inline void ExprFieldObject::extractKeys(std::vector<std::string>& outItems)
+{
+   outItems.clear();
+}
+
+inline void ExprFieldObject::getExpandRoots(std::vector<ExprObject*>& outItems)
+{
+}
+
+inline std::string ExprFieldObject::toString()
+{
+   return "";
+}
+
 inline ExprNode::ExprNode() : mNext(NULL)
 {
 }
@@ -558,45 +1143,46 @@ inline OperatorNode::OperatorNode(OperatorType op, ExprNode* left, ExprNode* rig
 
 inline ExprValue OperatorNode::evaluate(ExprState& state)
 {
-  ExprValue val;
-  
-  switch (mOp)
-  {
-     case OperatorType::OP_NE:
-        val.setBool(!mLeft->evaluate(state).testEq(mRight->evaluate(state)));
-        break;
-     case OperatorType::OP_EQ:
-        val.setBool(mLeft->evaluate(state).testEq(mRight->evaluate(state)));
-        break;
-     case OperatorType::OP_LTE:
-        val.setBool(mLeft->evaluate(state).numValue <= mRight->evaluate(state).numValue);
-        break;
-     case OperatorType::OP_GTE:
-        val.setBool(mLeft->evaluate(state).numValue >= mRight->evaluate(state).numValue);
-        break;
-     case OperatorType::OP_GT:
-        val.setBool(mLeft->evaluate(state).numValue > mRight->evaluate(state).numValue);
-        break;
-     case OperatorType::OP_LT:
-        val.setBool(mLeft->evaluate(state).numValue < mRight->evaluate(state).numValue);
-        break;
-     case OperatorType::OP_AND:
-        val.setBool(mLeft->evaluate(state).numValue && mRight->evaluate(state).numValue);
-        break;
-     case OperatorType::OP_OR:
-        val.setBool(mLeft->evaluate(state).numValue || mRight->evaluate(state).numValue);
-        break;
-     case OperatorType::OP_NOT:
-        val.setBool(!((bool)mLeft->evaluate(state).numValue));
-        break;
-     case OperatorType::OP_MUL:
-        val.setNumeric(mLeft->evaluate(state).numValue * mRight->evaluate(state).numValue);
-        break;
-     default:
-        break;
-  }
-  
-  return val;
+   ExprValue leftVal = mLeft ? mLeft->evaluate(state) : ExprValue();
+   ExprValue rightVal = mRight ? mRight->evaluate(state) : ExprValue();
+
+   switch (mOp)
+   {
+       case OperatorType::OP_NE:
+           return ExprValue().setBool(!leftVal.testEq(rightVal));
+
+       case OperatorType::OP_EQ:
+           return ExprValue().setBool(leftVal.testEq(rightVal));
+
+       case OperatorType::OP_LTE:
+           return ExprValue().setBool(leftVal.getNumber() <= rightVal.getNumber());
+
+       case OperatorType::OP_GTE:
+           return ExprValue().setBool(leftVal.getNumber() >= rightVal.getNumber());
+
+       case OperatorType::OP_GT:
+           return ExprValue().setBool(leftVal.getNumber() > rightVal.getNumber());
+
+       case OperatorType::OP_LT:
+           return ExprValue().setBool(leftVal.getNumber() < rightVal.getNumber());
+
+       case OperatorType::OP_AND:
+           return leftVal.getNumber() ? rightVal : leftVal;
+
+       case OperatorType::OP_OR:
+           return leftVal.getNumber() ? leftVal : rightVal;
+
+       case OperatorType::OP_NOT:
+           return ExprValue().setBool(!leftVal.getNumber());
+
+       case OperatorType::OP_MUL:
+           throw std::runtime_error("Cannot multiply numbers");
+
+       default:
+           break;
+   }
+
+   return ExprValue();
 }
 
 inline KeyAccessNode::KeyAccessNode(ExprNode* object, std::string key)
@@ -606,12 +1192,12 @@ inline KeyAccessNode::KeyAccessNode(ExprNode* object, std::string key)
 
 inline ExprValue KeyAccessNode::evaluate(ExprState& state)
 {
-   ExprValue mapObject = mObject->evaluate(state);
-   if (mapObject.objectInstance == NULL)
+   ExprObject* mapObject = mObject->evaluate(state).getObject();
+   if (mapObject == NULL)
    {
       throw std::runtime_error("Map object is not present");
    }
-   return mapObject.objectInstance->getMapKey(mKey);
+   return mapObject->getMapKey(mKey);
 }
 
 inline FunctionCallNode::FunctionCallNode(std::string function, ExprNode* args)
@@ -639,24 +1225,24 @@ inline ExpandoNode::ExpandoNode(ExprNode* left, ExprNode* right)
 
 inline ExprValue ExpandoNode::evaluate(ExprState& state)
 {
-   ExprValue baseObject = mLeft->evaluate(state);
+   ExprObject* baseObject = mLeft->evaluate(state).getObject();
    
    std::vector<ExprObject*> expandRoots;
-   if (baseObject.objectInstance == NULL)
+   if (baseObject == NULL)
    {
       throw std::runtime_error("Not an object");
    }
    
-   ExprArray* array = new ExprArray();
+   ExprArray* array = new ExprArray(&state);
    ExprValue retVal;
    retVal.setObject(array);
    
-   baseObject.objectInstance->getExpandRoots(expandRoots);
+   baseObject->getExpandRoots(expandRoots);
    ExprValue expandKey = mRight->evaluate(state);
    for (ExprObject* obj : expandRoots)
    {
-      ExprValue value = obj->getMapKey(expandKey.value);
-      if (!value.value.empty())
+      ExprValue value = obj->getMapKey(expandKey.getString());
+      if (!value.isNull())
       {
          array->mItems.push_back(value);
       }
@@ -673,16 +1259,16 @@ inline ArrayAccessNode::ArrayAccessNode(ExprNode* array, ExprNode* index)
 inline ExprValue ArrayAccessNode::evaluate(ExprState& state)
 {
    ExprValue index = mIndex->evaluate(state);
-   if (!index.isNumeric)
+   if (!index.isNumber())
    {
       throw std::runtime_error("Array accessor is not numeric");
    }
-   ExprValue arrayObject = mArray->evaluate(state);
-   if (arrayObject.objectInstance == NULL)
+   ExprObject* arrayObject = mArray->evaluate(state).getObject();
+   if (arrayObject == NULL)
    {
       throw std::runtime_error("Array object is not present");
    }
-   return arrayObject.objectInstance->getArrayIndex((uint32_t)index.numValue);
+   return arrayObject->getArrayIndex((uint32_t)index.getNumber());
 }
 
 inline IdentifierNode::IdentifierNode(std::string name) : mName(std::move(name))
@@ -810,7 +1396,7 @@ inline ExprNode* Parser::parsePrimary()
        token.type == TokenType::STRING)
    {
       ExprValue value;
-      value.setString(token.value.c_str());
+      value.setString(*mStringTable, token.value.c_str());
       return allocNode<LiteralNode>(value);
    }
    else if (token.type == TokenType::IDENTIFIER)
@@ -912,7 +1498,7 @@ inline ExprNode* Parser::parseDotAccess(ExprNode* primary)
       }
       else if (match(TokenType::OP_MUL))
       {
-         ExprValue rightKey;
+         std::string rightKey;
          advance(); // consume '*'
          
          if (match(TokenType::DOT))
@@ -920,12 +1506,12 @@ inline ExprNode* Parser::parseDotAccess(ExprNode* primary)
             advance(); // consume '.'
             while (match(TokenType::IDENTIFIER))
             {
-               rightKey.value += advance().value;
+               rightKey += advance().value;
                if (!match(TokenType::DOT))
                {
                   break;
                }
-               rightKey.value += ".";
+               rightKey += ".";
                advance(); // consume '.'
             }
          }
@@ -936,7 +1522,7 @@ inline ExprNode* Parser::parseDotAccess(ExprNode* primary)
             return NULL;
          }
          
-         primary = allocNode<ExpandoNode>(primary, new LiteralNode(rightKey));
+         primary = allocNode<ExpandoNode>(primary, new LiteralNode(ExprValue().setString(*mStringTable, rightKey.c_str())));
       }
       else
       {

@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdint.h>
 #include "include/expressionEval.h"
 
 using namespace ExpressionEval;
@@ -7,6 +8,8 @@ std::unordered_map<std::string, FuncInfo> ExprState::smFunctions;
 struct TestKVContext : public ExprObject
 {
    std::unordered_map<std::string, ExprValue> mValues;
+   
+   TestKVContext(ExprState* state) : ExprObject(state) {;}
    
    virtual ExprValue getArrayIndex(uint32_t index)
    {
@@ -26,6 +29,12 @@ struct TestKVContext : public ExprObject
       }
    }
    
+   inline ExprValue setMapKey(std::string key, ExprValue value)
+   {
+      mValues[key] = value;
+      return value;
+   }
+   
    virtual void toList(std::vector<ExprValue>& outItems)
    {
       for (auto itr : mValues)
@@ -43,9 +52,9 @@ struct TestKVContext : public ExprObject
    {
       for (auto itr : mValues)
       {
-         if (itr.second.objectInstance)
+         if (itr.second.getObject())
          {
-            outItems.push_back(itr.second.objectInstance);
+            outItems.push_back(itr.second.getObject());
          }
       }
    }
@@ -61,8 +70,10 @@ void testExpr(const char* value)
    {
       printf("%i[%s] '%s'\n", (int)tok.type, tokToString(tok.type), tok.value.c_str());
    }
-
+   
+   StringTable st;
    Parser parser(tokens);
+   parser.mStringTable = &st;
    CompiledStatement* stmts = parser.compile();
 
    for (ExprNode* node : stmts->mExpressions)
@@ -71,10 +82,13 @@ void testExpr(const char* value)
    }
    
    ExprState myState;
-   TestKVContext* ghTest = new TestKVContext();
-   TestKVContext* fooTest = new TestKVContext();
-   TestKVContext* subTest = new TestKVContext();
-   ExprArray* array = new ExprArray();
+   
+   myState.mStringTable = &st;
+   
+   TestKVContext* ghTest = new TestKVContext(&myState);
+   TestKVContext* fooTest = new TestKVContext(&myState);
+   TestKVContext* subTest = new TestKVContext(&myState);
+   ExprArray* array = new ExprArray(&myState);
    ExprValue arrayVal;
    arrayVal.setObject(array);
    
@@ -82,35 +96,31 @@ void testExpr(const char* value)
    val.setNumeric(10);
    array->mItems.push_back(val);
    
-   myState.addObject(ghTest);
-   myState.addObject(fooTest);
-   myState.addObject(subTest);
-   myState.addObject(array);
-   
    myState.setContext("github", ghTest);
    myState.setContext("foo", fooTest);
    
-   val.setString("push");
+   val.setString(st, "push");
+   
    ghTest->mValues["event_name"] = val;
    fooTest->mValues["list"] = arrayVal;
    
-   val.setString("tab");
+   val.setString(st, "tab");
    fooTest->mValues["bar"] = val;
    
-   val.setString("notab");
+   val.setString(st, "notab");
    subTest->mValues["bar"] = val;
    val.setObject(subTest);
    fooTest->mValues["cake"] = val;
    
    ExprValue result = myState.evaluate(stmts->mRoot);
    
-   if (result.objectInstance)
+   if (result.getObject())
    {
-      printf("Result=(object)%s\n", result.objectInstance->toString().c_str());
+      printf("Result=(object)%s\n", result.getObject()->toString().c_str());
    }
    else
    {
-      printf("Result=%s\n", result.value.c_str());
+      printf("Result=%s\n", result.coerceString(st));
    }
    
    delete stmts;
@@ -127,8 +137,10 @@ int main(int argc, char** argv)
       {
          return ret;
       }
-      ret.setBool(!argv[0].value.empty() && !argv[1].value.empty() &&
-                  argv[0].value.find(argv[1].value) != std::string::npos);
+      std::string str1 = argv[0].getString();
+      std::string str2 = argv[1].getString();
+      ret.setBool(!str1.empty() && !str2.empty() &&
+                  str1.find(str2) != std::string::npos);
       return ret;
    };
    ExprState::smFunctions["contains"] = containsFunc;
