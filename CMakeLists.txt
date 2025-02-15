@@ -5,6 +5,10 @@ project(ForgeRunner)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-Wno-invalid-offsetof)
+endif()
+
 file(GLOB_RECURSE PROTO_SRC_FILES "proto_src/*.cc")
 file(GLOB_RECURSE SRC_FILES "src/*.cc")
 
