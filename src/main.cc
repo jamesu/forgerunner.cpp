@@ -1119,6 +1119,18 @@ template<class T> void getTypedObjectsFromArray(ExprArray* arr, std::vector<T*>&
    }
 }
 
+const char* RunnerResultToString(runner::v1::Result res)
+{
+   static const char* names[] = {
+      "success",
+      "failure",
+      "cancelled",
+      "skipped"
+   };
+   uint8_t key = std::min<uint8_t>((uint8_t)res, (uint8_t)(sizeof(names) / sizeof(names[0])));
+   return names[key];
+}
+
 // Example thread to send dummy updates to the server
 void PerformTask(TaskTracker* currentTask)
 {
@@ -1130,12 +1142,22 @@ void PerformTask(TaskTracker* currentTask)
    std::string jobName = jobList[0];
    JobContext* jobContext = currentTask->mWorkflow->mJobs.asObject<ExprMap>()->getMapKey(jobName).asObject<JobContext>();
    
-   ExprMultiKey* env = new ExprMultiKey(currentTask->mExprState);
+   ExprState* exprState = currentTask->mExprState;
+   ExprMultiKey* env = new ExprMultiKey(exprState);
    env->mSlots[0] = currentTask->mWorkflow->mEnv.getObject();
    env->mSlots[1] = jobContext->mEnv.getObject();
    
+   ExprMap* needsMap = new ExprMap(currentTask->mExprState);
+   for (auto itr : currentTask->mTask.needs())
+   {
+      ExprMap* outMap = ProtoKVToObject(*exprState, itr.second.outputs());
+      ExprMap* baseMap = new ExprMap(exprState);
+      baseMap->setMapKey("outputs", ExprValue().setObject(outMap));
+      baseMap->setMapKey("result", ExprValue().setString(*exprState->mStringTable, RunnerResultToString(itr.second.result())));
+      needsMap->setMapKey(itr.first, ExprValue().setObject(baseMap));
+   }
+   
    // Setup context for job
-   ExprState* exprState = currentTask->mExprState;
    exprState->setContext("github", ProtoStructToObject(*exprState, currentTask->mTask.context()));
    exprState->setContext("env", env);
    exprState->setContext("vars", ProtoKVToObject(*exprState, currentTask->mTask.vars()));
@@ -1146,7 +1168,7 @@ void PerformTask(TaskTracker* currentTask)
    exprState->setContext("secrets", ProtoKVToObject(*exprState, currentTask->mTask.secrets()));
    exprState->setContext("strategy", new ExprMap(exprState));
    exprState->setContext("matrix", new ExprMap(exprState));
-   exprState->setContext("needs", new ExprMap(exprState));
+   exprState->setContext("needs", needsMap);
    exprState->setContext("input", new ExprMap(exprState));
    
    std::vector<JobStep*> steps;
