@@ -37,7 +37,32 @@ struct RunnerState
    std::string endpoint;
    std::string uuid;
    std::string token;
+   runner::v1::Runner info;
 };
+
+const char* RunnerStatusToString(runner::v1::RunnerStatus status)
+{
+   static const char* names[] = {
+      "",
+      "idle",
+      "active",
+      "offline"
+   };
+   uint8_t key = std::min<uint8_t>((uint8_t)status, (uint8_t)(sizeof(names) / sizeof(names[0])));
+   return names[key];
+}
+
+const char* RunnerResultToString(runner::v1::Result res)
+{
+   static const char* names[] = {
+      "success",
+      "failure",
+      "cancelled",
+      "skipped"
+   };
+   uint8_t key = std::min<uint8_t>((uint8_t)res, (uint8_t)(sizeof(names) / sizeof(names[0])));
+   return names[key];
+}
 
 // Util func to perform basic protobuf requests to a connectrpc endpoint
 template<class T, class R> bool QuickRequest(CURL *curl, RunnerState& state, const char* url, T& request, R& response, connectrpc::ErrorDetail& error)
@@ -201,6 +226,7 @@ struct TaskTracker
       }
    };
    
+   runner::v1::Runner mRunner;
    runner::v1::Task mTask;
    runner::v1::UpdateTaskRequest mNextTaskRequest;
    runner::v1::StepState* mNextStepState;
@@ -219,9 +245,10 @@ struct TaskTracker
    std::atomic<bool> mFinished;
    std::atomic<bool> mCancelled;
    
-   TaskTracker(const runner::v1::Task& task, ExprState* state, SingleWorkflowContext* ctx)
+   TaskTracker(const runner::v1::Runner& runner, const runner::v1::Task& task, ExprState* state, SingleWorkflowContext* ctx)
    {
       mTask = task;
+      mRunner = runner;
       mNextTaskRequest.mutable_state()->set_id(task.id());
       mLastLogAck = 0;
       mLastTaskAck = 0;
@@ -547,6 +574,11 @@ bool SetupRunner(CURL *curl, RunnerState& state, int argc, char** argv)
       return false;
    }
    
+   if (rspDeclare.has_runner())
+   {
+      state.info = rspDeclare.runner();
+   }
+   
    return true;
 }
 
@@ -782,6 +814,47 @@ struct JobStep : public BasicContext
    std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<JobStep>(); }
 };
 
+struct RunnerInfo : public ExprFieldObject
+{
+   ExprValue mId;
+   ExprValue mUUID;
+   ExprValue mToken;
+   ExprValue mName;
+   ExprValue mStatus;
+   ExprValue mLabels;
+   // gh stuff
+   ExprValue mOs;
+   ExprValue mArch;
+   ExprValue mTemp;
+   ExprValue mToolCache;
+   ExprValue mDebug;
+   ExprValue mEnvironment;
+   
+   RunnerInfo(ExprState* state) : ExprFieldObject(state)
+   {
+      mLabels = ExprValue().setObject(new ExprArray(state));
+   }
+   
+   std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<RunnerInfo>(); }
+};
+
+template<> void ExprFieldObject::registerFieldsForType<RunnerInfo>()
+{
+   registerField<JobContext>("id", offsetof(RunnerInfo, mId), ExprValue::STRING);
+   registerField<JobContext>("uuid", offsetof(RunnerInfo, mUUID), ExprValue::STRING);
+   registerField<JobContext>("token", offsetof(RunnerInfo, mToken), ExprValue::STRING);
+   registerField<JobContext>("name", offsetof(RunnerInfo, mName), ExprValue::STRING);
+   registerField<JobContext>("status", offsetof(RunnerInfo, mStatus), ExprValue::STRING);
+   registerField<JobContext>("labels", offsetof(RunnerInfo, mLabels), ExprValue::OBJECT, false);
+   //
+   registerField<JobContext>("os", offsetof(RunnerInfo, mOs), ExprValue::STRING);
+   registerField<JobContext>("arch", offsetof(RunnerInfo, mArch), ExprValue::STRING);
+   registerField<JobContext>("temp", offsetof(RunnerInfo, mTemp), ExprValue::STRING);
+   registerField<JobContext>("tool_cache", offsetof(RunnerInfo, mToolCache), ExprValue::STRING);
+   registerField<JobContext>("debug", offsetof(RunnerInfo, mDebug), ExprValue::BOOLEAN);
+   registerField<JobContext>("environment", offsetof(RunnerInfo, mEnvironment), ExprValue::STRING);
+}
+
 template<> void ExprFieldObject::registerFieldsForType<JobStep>()
 {
    auto& parentReg = getFieldRegistry<JobStep::Parent>();
@@ -789,6 +862,76 @@ template<> void ExprFieldObject::registerFieldsForType<JobStep>()
    registerField<JobStep>("run", offsetof(JobStep, mRun), ExprValue::STRING);
    registerField<JobStep>("shell", offsetof(JobStep, mShell), ExprValue::STRING);
    registerField<JobStep>("cwd", offsetof(JobStep, mCwd), ExprValue::STRING);
+}
+
+const char* GetArchName()
+{
+#if defined(__x86_64__) || defined(_M_X64)
+    return "X64";
+#elif defined(__i386__) || defined(_M_IX86)
+    return "X86";
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    return "ARM64";
+#elif defined(__arm__) || defined(_M_ARM)
+    return "ARM";
+#elif defined(__powerpc64__) || defined(__ppc64__)
+    return "PPC64";
+#elif defined(__powerpc__) || defined(__ppc__)
+    return "PPC";
+#elif defined(__riscv) && (__riscv_xlen == 64)
+    return "RV64";
+#elif defined(__riscv) && (__riscv_xlen == 32)
+    return "RV32";
+#else
+    return "UNKNOWN";
+#endif
+}
+
+const char* GetOSName()
+{
+#if defined(_WIN32) || defined(_WIN64)
+    return "Windows";
+#elif defined(__linux__)
+    return "Linux";
+#elif defined(__APPLE__) && defined(__MACH__)
+   return "macOS";
+#elif defined(__FreeBSD__)
+    return "FreeBSD";
+#elif defined(__NetBSD__)
+    return "NetBSD";
+#elif defined(__OpenBSD__)
+    return "OpenBSD";
+#elif defined(__unix__) || defined(__unix)
+    return "Unix";
+#else
+    return "Unknown";
+#endif
+}
+
+void SetRunnerInfoFromProto(ExprState& state, runner::v1::Runner& info, RunnerInfo* outInfo)
+{
+   outInfo->mId.setString(*state.mStringTable, std::to_string(info.id()).c_str());
+   outInfo->mUUID.setString(*state.mStringTable, info.uuid().c_str());
+   outInfo->mToken.setString(*state.mStringTable, info.token().c_str());
+   outInfo->mName.setString(*state.mStringTable, info.name().c_str());
+   outInfo->mStatus.setString(*state.mStringTable, RunnerStatusToString(info.status()));
+   
+   ExprArray* labelList = dynamic_cast<ExprArray*>(outInfo->mLabels.getObject());
+   if (labelList)
+   {
+      labelList->clear();
+      for (auto& itr : info.labels())
+      {
+         labelList->addArrayValue(ExprValue().setString(*state.mStringTable, itr.c_str()));
+      }
+   }
+   
+   outInfo->mOs.setString(*state.mStringTable, GetOSName());
+   outInfo->mArch.setString(*state.mStringTable, GetArchName());
+   outInfo->mTemp.setString(*state.mStringTable, "/tmp");
+   outInfo->mToolCache.setString(*state.mStringTable, "");
+   outInfo->mDebug.setBool(false);
+   outInfo->mEnvironment.setString(*state.mStringTable, "self-hosted");
 }
 
 
@@ -1093,7 +1236,7 @@ TaskTracker* PollForTask(CURL* curl, RunnerState& state)
             return NULL;
          }
 
-         tracker = new TaskTracker(rspTask.task(), exprState, workFlowContext);
+         tracker = new TaskTracker(state.info, rspTask.task(), exprState, workFlowContext);
       }
    }
    
@@ -1119,22 +1262,13 @@ template<class T> void getTypedObjectsFromArray(ExprArray* arr, std::vector<T*>&
    }
 }
 
-const char* RunnerResultToString(runner::v1::Result res)
-{
-   static const char* names[] = {
-      "success",
-      "failure",
-      "cancelled",
-      "skipped"
-   };
-   uint8_t key = std::min<uint8_t>((uint8_t)res, (uint8_t)(sizeof(names) / sizeof(names[0])));
-   return names[key];
-}
-
 // Example thread to send dummy updates to the server
 void PerformTask(TaskTracker* currentTask)
 {
    char buffer[512];
+   
+   // SETUP
+   currentTask->beginJob();
    
    std::vector<std::string> jobList;
    currentTask->mWorkflow->mJobs.getObject()->extractKeys(jobList);
@@ -1157,25 +1291,31 @@ void PerformTask(TaskTracker* currentTask)
       needsMap->setMapKey(itr.first, ExprValue().setObject(baseMap));
    }
    
+   RunnerInfo* runnerInfo = new RunnerInfo(exprState);
+   ExprMap* gitContext = ProtoStructToObject(*exprState, currentTask->mTask.context());
+   
+   SetRunnerInfoFromProto(*exprState, currentTask->mRunner, runnerInfo);
+   
    // Setup context for job
-   exprState->setContext("github", ProtoStructToObject(*exprState, currentTask->mTask.context()));
+   exprState->setContext("github", gitContext);
    exprState->setContext("env", env);
    exprState->setContext("vars", ProtoKVToObject(*exprState, currentTask->mTask.vars()));
    exprState->setContext("job", jobContext);
    exprState->setContext("jobs", currentTask->mWorkflow->mJobs.getObject());
    exprState->setContext("steps", jobContext->mSteps.getObject());
-   exprState->setContext("runner", new ExprMap(exprState));
+   exprState->setContext("runner", runnerInfo);
    exprState->setContext("secrets", ProtoKVToObject(*exprState, currentTask->mTask.secrets()));
+   exprState->setContext("needs", needsMap);
+   exprState->setContext("inputs", new ExprMap(exprState)); // NOTE: this might need to be set inside the job?
+   // NOTE: no matrix info is sent down so these are placeholders for now
    exprState->setContext("strategy", new ExprMap(exprState));
    exprState->setContext("matrix", new ExprMap(exprState));
-   exprState->setContext("needs", needsMap);
-   exprState->setContext("input", new ExprMap(exprState));
    
    std::vector<JobStep*> steps;
    getTypedObjectsFromArray<JobStep>(jobContext->mSteps.asObject<ExprArray>(), steps);
+   // SETUP DONE
    
-   currentTask->beginJob();
-   snprintf(buffer, sizeof(buffer), "Performing %i tasks for job %s...", steps.size(), jobName.c_str());
+   snprintf(buffer, sizeof(buffer), "Performing %i tasks for job %s...", (int)steps.size(), jobName.c_str());
    currentTask->log(buffer);
   
    //getTypedObjectsFromArray
@@ -1186,6 +1326,7 @@ void PerformTask(TaskTracker* currentTask)
    {
       // Update context for step
       env->mSlots[2] = step->mEnv.getObject();
+      exprState->setContext("inputs", gitContext->getMapKey("event").getObject()->getMapKey("inputs").getObject());
       
       //
       currentTask->beginStep(stepCount);
@@ -1231,6 +1372,7 @@ int main(int argc, char** argv)
    ExprFieldObject::registerFieldsForType<JobContext>();
    ExprFieldObject::registerFieldsForType<JobStep>();
    ExprFieldObject::registerFieldsForType<SingleWorkflowContext>();
+   ExprFieldObject::registerFieldsForType<RunnerInfo>();
    
    RunnerState state;
    state.tasks_version = 0;
