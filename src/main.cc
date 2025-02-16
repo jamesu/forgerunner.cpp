@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <chrono>
 #include <thread>
+#include <fstream>
+#include <filesystem>
 #include <mutex>
 #include <atomic>
 #include <curl/curl.h>
@@ -288,6 +290,13 @@ struct TaskTracker
       return ts;
    }
    
+   void getUpdate(runner::v1::UpdateTaskRequest& outReq)
+   {
+      std::lock_guard<std::mutex> lock(mMutex);
+      outReq = mNextTaskRequest;
+      mNextTaskRequest.mutable_outputs()->clear();
+   }
+   
    void beginStep(uint64_t stepIDX)
    {
       std::lock_guard<std::mutex> lock(mMutex);
@@ -404,6 +413,13 @@ struct TaskTracker
       {
          mBatchQueue.erase(eraseStart, eraseEnd);
       }
+   }
+   
+   void addOutput(std::string& name, const std::string& value)
+   {
+      std::lock_guard<std::mutex> lock(mMutex);
+      mLastTaskAck = std::min<uint64_t>(mLastTaskAck, mLastLogAck);
+      mNextTaskRequest.mutable_outputs()->insert({name, value});
    }
    
    void setResult(runner::v1::Result result)
@@ -608,8 +624,11 @@ bool HealthCheck(CURL *curl, RunnerState& state, TaskTracker* tracker)
       }
       
       // Send task states
+      runner::v1::UpdateTaskRequest nextUpdate;
+      tracker->getUpdate(nextUpdate);
+      
       if (QuickRequest(curl, state, "runner.v1.RunnerService/UpdateTask",
-                       tracker->mNextTaskRequest, rspTaskUpdate, error))
+                       nextUpdate, rspTaskUpdate, error))
       {
          printf("===>Got update task response, seeing what we can do....\n");
          
@@ -906,6 +925,78 @@ const char* GetOSName()
 #else
     return "Unknown";
 #endif
+}
+
+std::string Trim(const std::string &str)
+{
+    size_t first = str.find_first_not_of(" \t\n\r");
+    if (first == std::string::npos) return "";
+    size_t last = str.find_last_not_of(" \t\n\r");
+    return str.substr(first, last - first + 1);
+}
+
+std::unordered_map<std::string, std::string> ParseEnvFile(const std::string &filename)
+{
+    std::ifstream file(filename);
+    std::unordered_map<std::string, std::string> outputVars;
+    std::string line, key, value;
+    bool inMultiline = false;
+    std::string delimiter = "";
+    
+    if (!file)
+    {
+       printf("Error: Could not open file %s\n", filename.c_str());
+       return {};
+    }
+
+    while (getline(file, line))
+    {
+        line = Trim(line);
+
+        if (line.empty())
+        {
+           continue;
+        }
+       
+        if (inMultiline)
+        {
+            if (line == delimiter)
+            {
+                outputVars[key] = value;
+                inMultiline = false;
+                key = "";
+                value = "";
+                delimiter = "";
+            }
+            else
+            {
+                value += (value.empty() ? "" : "\n") + line;
+            }
+        }
+        else
+        {
+            size_t pos = line.find('=');
+            if (pos != std::string::npos)
+            {
+                key = Trim(line.substr(0, pos));
+               std::string val = Trim(line.substr(pos + 1));
+
+                if (val.size() > 2 && val.substr(0, 2) == "<<")
+                {
+                    delimiter = val.substr(2);
+                    inMultiline = true;
+                    value = "";
+                }
+                else
+                {
+                    outputVars[key] = val;
+                }
+            }
+        }
+    }
+
+    file.close();
+    return outputVars;
 }
 
 void SetRunnerInfoFromProto(ExprState& state, runner::v1::Runner& info, RunnerInfo* outInfo)
@@ -1393,6 +1484,23 @@ void PerformTask(TaskTracker* currentTask)
       sleep(1);
       currentTask->endStep(result);
       stepCount++;
+   }
+   
+   // Set outputs according to job description
+   ExprMap* outputList = jobContext->mOutputs.asObject<ExprMap>();
+   if (outputList)
+   {
+      std::vector<std::string> outputKeys;
+      outputList->extractKeys(outputKeys);
+      for (std::string& key : outputKeys)
+      {
+         ExprValue val = outputList->getMapKey(key);
+         if (val.isString())
+         {
+            std::string outputData = exprState->substituteExpressions(val.getString());
+            currentTask->addOutput(key, outputData.c_str());
+         }
+      }
    }
    
    //
