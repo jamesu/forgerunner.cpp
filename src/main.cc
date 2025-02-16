@@ -220,8 +220,8 @@ void PrintTaskDetails(const runner::v1::Task& task)
    }
 }
 
-struct JobStep;
-struct SingleWorkflowContext;
+struct JobStepDefinition;
+struct SingleWorkflowDefinition;
 
 // Thread safe util class to handle updating a task.
 // Note that changes are effectively batched until HealthCheck dispatches API calls.
@@ -259,14 +259,14 @@ struct TaskTracker
    uint64_t mLastTaskAck;
    
    ExprState* mExprState;
-   SingleWorkflowContext* mWorkflow;
+   SingleWorkflowDefinition* mWorkflow;
    
    std::mutex mMutex;
    std::mutex mJobInfoMutex;
    std::atomic<bool> mFinished;
    std::atomic<bool> mCancelled;
    
-   TaskTracker(const runner::v1::Runner& runner, const runner::v1::Task& task, ExprState* state, SingleWorkflowContext* ctx)
+   TaskTracker(const runner::v1::Runner& runner, const runner::v1::Task& task, ExprState* state, SingleWorkflowDefinition* ctx)
    {
       mTask = task;
       mRunner = runner;
@@ -718,7 +718,7 @@ ExprValue YAMLToExpr(ExprState& state, ExprObject* baseObject, fkyaml::node& nod
    return ret;
 }
 
-struct SingleWorkflowContext : public ExprFieldObject
+struct SingleWorkflowDefinition : public ExprFieldObject
 {
    ExprValue mName;
    ExprValue mOn;
@@ -726,18 +726,18 @@ struct SingleWorkflowContext : public ExprFieldObject
    ExprValue mJobs;
    ExprValue mDefaults;
    
-   SingleWorkflowContext(ExprState* state);
+   SingleWorkflowDefinition(ExprState* state);
    
-   std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<SingleWorkflowContext>(); }
+   std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<SingleWorkflowDefinition>(); }
 };
 
-template<> void ExprFieldObject::registerFieldsForType<SingleWorkflowContext>()
+template<> void ExprFieldObject::registerFieldsForType<SingleWorkflowDefinition>()
 {
-   registerField<SingleWorkflowContext>("name", offsetof(SingleWorkflowContext, mName), ExprValue::STRING);
-   registerField<SingleWorkflowContext>("on", offsetof(SingleWorkflowContext, mOn), ExprValue::OBJECT);
-   registerField<SingleWorkflowContext>("env", offsetof(SingleWorkflowContext, mEnv), ExprValue::OBJECT);
-   registerField<SingleWorkflowContext>("jobs", offsetof(SingleWorkflowContext, mJobs), ExprValue::OBJECT, false);
-   registerField<SingleWorkflowContext>("defaults", offsetof(SingleWorkflowContext, mDefaults), ExprValue::OBJECT);
+   registerField<SingleWorkflowDefinition>("name", offsetof(SingleWorkflowDefinition, mName), ExprValue::STRING);
+   registerField<SingleWorkflowDefinition>("on", offsetof(SingleWorkflowDefinition, mOn), ExprValue::OBJECT);
+   registerField<SingleWorkflowDefinition>("env", offsetof(SingleWorkflowDefinition, mEnv), ExprValue::OBJECT);
+   registerField<SingleWorkflowDefinition>("jobs", offsetof(SingleWorkflowDefinition, mJobs), ExprValue::OBJECT, false);
+   registerField<SingleWorkflowDefinition>("defaults", offsetof(SingleWorkflowDefinition, mDefaults), ExprValue::OBJECT);
 }
 
 // Context shared with jobs and steps
@@ -792,7 +792,7 @@ struct StrategyContext;
 struct ServicesContext;
 struct PermissionsContext;
 
-struct JobContext : public BasicContext
+struct JobDefinition : public BasicContext
 {
    typedef BasicContext Parent;
    
@@ -807,26 +807,26 @@ struct JobContext : public BasicContext
    ExprValue mRunsOn;
    ExprValue mConcurrencyGroup;
    
-   JobContext(ExprState* state);
-   std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<JobContext>(); }
+   JobDefinition(ExprState* state);
+   std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<JobDefinition>(); }
 };
 
-template<> void ExprFieldObject::registerFieldsForType<JobContext>()
+template<> void ExprFieldObject::registerFieldsForType<JobDefinition>()
 {
-   auto& parentReg = getFieldRegistry<JobContext::Parent>();
-   getFieldRegistry<JobContext>().insert(parentReg.begin(), parentReg.end());
-   registerField<JobContext>("container", offsetof(JobContext, mContainer), ExprValue::OBJECT);
-   registerField<JobContext>("strategy", offsetof(JobContext, mStrategy), ExprValue::STRING);
-   registerField<JobContext>("services", offsetof(JobContext, mServices), ExprValue::OBJECT);
-   registerField<JobContext>("permissions", offsetof(JobContext, mPermissions), ExprValue::OBJECT);
-   registerField<JobContext>("defaults", offsetof(JobContext, mDefaults), ExprValue::OBJECT);
-   registerField<JobContext>("steps", offsetof(JobContext, mSteps), ExprValue::OBJECT, false);
-   registerField<JobContext>("needs", offsetof(JobContext, mNeeds), ExprValue::OBJECT);
-   registerField<JobContext>("runs-on", offsetof(JobContext, mRunsOn), ExprValue::STRING);
-   registerField<JobContext>("concurrency-group", offsetof(JobContext, mConcurrencyGroup), ExprValue::STRING);
+   auto& parentReg = getFieldRegistry<JobDefinition::Parent>();
+   getFieldRegistry<JobDefinition>().insert(parentReg.begin(), parentReg.end());
+   registerField<JobDefinition>("container", offsetof(JobDefinition, mContainer), ExprValue::OBJECT);
+   registerField<JobDefinition>("strategy", offsetof(JobDefinition, mStrategy), ExprValue::STRING);
+   registerField<JobDefinition>("services", offsetof(JobDefinition, mServices), ExprValue::OBJECT);
+   registerField<JobDefinition>("permissions", offsetof(JobDefinition, mPermissions), ExprValue::OBJECT);
+   registerField<JobDefinition>("defaults", offsetof(JobDefinition, mDefaults), ExprValue::OBJECT);
+   registerField<JobDefinition>("steps", offsetof(JobDefinition, mSteps), ExprValue::OBJECT, false);
+   registerField<JobDefinition>("needs", offsetof(JobDefinition, mNeeds), ExprValue::OBJECT);
+   registerField<JobDefinition>("runs-on", offsetof(JobDefinition, mRunsOn), ExprValue::STRING);
+   registerField<JobDefinition>("concurrency-group", offsetof(JobDefinition, mConcurrencyGroup), ExprValue::STRING);
 }
 
-struct JobStep : public BasicContext
+struct JobStepDefinition : public BasicContext
 {
    typedef BasicContext Parent;
    
@@ -834,13 +834,13 @@ struct JobStep : public BasicContext
    ExprValue mShell;
    ExprValue mCwd;
    
-   JobStep(ExprState* state) : BasicContext(state)
+   JobStepDefinition(ExprState* state) : BasicContext(state)
    {
    }
    
-   virtual ~JobStep() = default;
+   virtual ~JobStepDefinition() = default;
    
-   virtual runner::v1::Result execute(TaskTracker* tracker)
+   virtual runner::v1::Result execute(TaskTracker* tracker, ExprMap* outputs)
    {
       std::string cmdToRun = mState->substituteExpressions(mRun.getStringSafe());
       char buffer[4096];
@@ -849,8 +849,86 @@ struct JobStep : public BasicContext
       return runner::v1::RESULT_SUCCESS;
    }
    
-   std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<JobStep>(); }
+   std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<JobStepDefinition>(); }
 };
+
+struct JobResultContext : public ExprFieldObject
+{
+   ExprValue mResult;
+   ExprValue mOutputs;
+   
+   JobResultContext(ExprState* state);
+   
+   std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<JobResultContext>(); }
+};
+
+template<> void ExprFieldObject::registerFieldsForType<JobResultContext>()
+{
+   registerField<JobResultContext>("result", offsetof(JobResultContext, mResult), ExprValue::STRING);
+   registerField<JobResultContext>("outputs", offsetof(JobResultContext, mOutputs), ExprValue::OBJECT);
+}
+
+struct CurrentJobContext : public ExprFieldObject
+{
+   ExprValue mContainer;
+   ExprValue mServices;
+   ExprValue mStatus;
+   
+   CurrentJobContext(ExprState* state);
+   
+   std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<CurrentJobContext>(); }
+};
+
+template<> void ExprFieldObject::registerFieldsForType<CurrentJobContext>()
+{
+   registerField<CurrentJobContext>("container", offsetof(CurrentJobContext, mContainer), ExprValue::OBJECT, false);
+   registerField<CurrentJobContext>("services", offsetof(CurrentJobContext, mServices), ExprValue::OBJECT, false);
+   registerField<CurrentJobContext>("status", offsetof(CurrentJobContext, mStatus), ExprValue::STRING);
+}
+
+CurrentJobContext::CurrentJobContext(ExprState* state) : ExprFieldObject(state)
+{
+   ExprMap* map = new ExprMap(state);
+   map->mAddObjectFunc = ExprMap::addTypedObjectFunc<ExprMap>;
+   mContainer = ExprValue().setObject(map);
+   map = new ExprMap(state);
+   map->mAddObjectFunc = ExprMap::addTypedObjectFunc<ExprMap>;
+   mServices = ExprValue().setObject(map);
+}
+
+
+JobResultContext::JobResultContext(ExprState* state) : ExprFieldObject(state)
+{
+   ExprMap* map = new ExprMap(state);
+   map->mAddObjectFunc = ExprMap::addTypedObjectFunc<ExprMap>;
+   mOutputs = ExprValue().setObject(map);
+}
+
+struct JobStepContext : public ExprFieldObject
+{
+   ExprValue mOutputs;
+   ExprValue mConclusion;
+   ExprValue mOutcome;
+   
+   JobStepContext(ExprState* state);
+   
+   std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<JobResultContext>(); }
+};
+
+template<> void ExprFieldObject::registerFieldsForType<JobStepContext>()
+{
+   registerField<JobStepContext>("outputs", offsetof(JobStepContext, mOutputs), ExprValue::OBJECT);
+   registerField<JobStepContext>("conclusion", offsetof(JobStepContext, mConclusion), ExprValue::STRING);
+   registerField<JobStepContext>("outcome", offsetof(JobStepContext, mOutcome), ExprValue::STRING);
+}
+
+JobStepContext::JobStepContext(ExprState* state) : ExprFieldObject(state)
+{
+   ExprMap* map = new ExprMap(state);
+   map->mAddObjectFunc = ExprMap::addTypedObjectFunc<ExprMap>;
+   mOutputs = ExprValue().setObject(map);
+}
+
 
 struct RunnerInfo : public ExprFieldObject
 {
@@ -893,13 +971,13 @@ template<> void ExprFieldObject::registerFieldsForType<RunnerInfo>()
    registerField<RunnerInfo>("environment", offsetof(RunnerInfo, mEnvironment), ExprValue::STRING);
 }
 
-template<> void ExprFieldObject::registerFieldsForType<JobStep>()
+template<> void ExprFieldObject::registerFieldsForType<JobStepDefinition>()
 {
-   auto& parentReg = getFieldRegistry<JobStep::Parent>();
-   getFieldRegistry<JobStep>().insert(parentReg.begin(), parentReg.end());
-   registerField<JobStep>("run", offsetof(JobStep, mRun), ExprValue::STRING);
-   registerField<JobStep>("shell", offsetof(JobStep, mShell), ExprValue::STRING);
-   registerField<JobStep>("cwd", offsetof(JobStep, mCwd), ExprValue::STRING);
+   auto& parentReg = getFieldRegistry<JobStepDefinition::Parent>();
+   getFieldRegistry<JobStepDefinition>().insert(parentReg.begin(), parentReg.end());
+   registerField<JobStepDefinition>("run", offsetof(JobStepDefinition, mRun), ExprValue::STRING);
+   registerField<JobStepDefinition>("shell", offsetof(JobStepDefinition, mShell), ExprValue::STRING);
+   registerField<JobStepDefinition>("cwd", offsetof(JobStepDefinition, mCwd), ExprValue::STRING);
 }
 
 const char* GetArchName()
@@ -1045,17 +1123,17 @@ void SetRunnerInfoFromProto(ExprState& state, runner::v1::Runner& info, RunnerIn
 }
 
 
-SingleWorkflowContext::SingleWorkflowContext(ExprState* state) : ExprFieldObject(state)
+SingleWorkflowDefinition::SingleWorkflowDefinition(ExprState* state) : ExprFieldObject(state)
 {
    ExprMap* jobMap = new ExprMap(state);
-   jobMap->mAddObjectFunc = ExprArray::addTypedObjectFunc<JobContext>;
+   jobMap->mAddObjectFunc = ExprArray::addTypedObjectFunc<JobDefinition>;
    mJobs.setObject(jobMap);
 }
 
-JobContext::JobContext(ExprState* state) : BasicContext(state)
+JobDefinition::JobDefinition(ExprState* state) : BasicContext(state)
 {
    ExprArray* jobArray = new ExprArray(state);
-   jobArray->mAddObjectFunc = ExprArray::addTypedObjectFunc<JobStep>;
+   jobArray->mAddObjectFunc = ExprArray::addTypedObjectFunc<JobStepDefinition>;
    mSteps = ExprValue().setObject(jobArray);
 }
 
@@ -1305,7 +1383,7 @@ TaskTracker* PollForTask(CURL* curl, RunnerState& state)
       {
          printf("Runner has a task!\n");
          PrintTaskDetails(rspTask.task());
-         std::vector<JobStep*> steps;
+         std::vector<JobStepDefinition*> steps;
 
          if (!rspTask.task().has_workflow_payload())
          {
@@ -1315,7 +1393,7 @@ TaskTracker* PollForTask(CURL* curl, RunnerState& state)
          ExprState* exprState = new ExprState();
          
          exprState->mStringTable = new ExpressionEval::StringTable();
-         SingleWorkflowContext* workFlowContext = new SingleWorkflowContext(exprState);
+         SingleWorkflowDefinition* workFlowContext = new SingleWorkflowDefinition(exprState);
 
          try
          {
@@ -1384,21 +1462,27 @@ void PerformTask(TaskTracker* currentTask)
    currentTask->mWorkflow->mJobs.getObject()->extractKeys(jobList);
    
    std::string jobName = jobList[0];
-   JobContext* jobContext = currentTask->mWorkflow->mJobs.asObject<ExprMap>()->getMapKey(jobName).asObject<JobContext>();
+   JobDefinition* jobDefinition = currentTask->mWorkflow->mJobs.asObject<ExprMap>()->getMapKey(jobName).asObject<JobDefinition>();
    
    ExprState* exprState = currentTask->mExprState;
    ExprMultiKey* env = new ExprMultiKey(exprState);
    env->mSlots[0] = currentTask->mWorkflow->mEnv.getObject();
-   env->mSlots[1] = jobContext->mEnv.getObject();
+   env->mSlots[1] = jobDefinition->mEnv.getObject();
    
+   ExprArray* jobsList = new ExprArray(exprState);
+   ExprMap* stepsList = new ExprMap(exprState);
+   CurrentJobContext* currentJobContext = new CurrentJobContext(exprState);
+   
+   // NOTE: "needs" and "jobs" are basically the same
    ExprMap* needsMap = new ExprMap(currentTask->mExprState);
    for (auto itr : currentTask->mTask.needs())
    {
       ExprMap* outMap = ProtoKVToObject(*exprState, itr.second.outputs());
-      ExprMap* baseMap = new ExprMap(exprState);
-      baseMap->setMapKey("outputs", ExprValue().setObject(outMap));
-      baseMap->setMapKey("result", ExprValue().setString(*exprState->mStringTable, RunnerResultToString(itr.second.result())));
-      needsMap->setMapKey(itr.first, ExprValue().setObject(baseMap));
+      JobResultContext* jobCtx = new JobResultContext(exprState);
+      jobCtx->mOutputs.setObject(outMap);
+      jobCtx->mResult.setString(*exprState->mStringTable, RunnerResultToString(itr.second.result()));
+      needsMap->setMapKey(itr.first, ExprValue().setObject(jobCtx));
+      jobsList->addArrayValue(ExprValue().setObject(jobCtx));
    }
    
    RunnerInfo* runnerInfo = new RunnerInfo(exprState);
@@ -1410,25 +1494,42 @@ void PerformTask(TaskTracker* currentTask)
    exprState->setContext("github", gitContext);
    exprState->setContext("env", env);
    exprState->setContext("vars", ProtoKVToObject(*exprState, currentTask->mTask.vars()));
-   exprState->setContext("job", jobContext);
-   exprState->setContext("jobs", currentTask->mWorkflow->mJobs.getObject());
-   exprState->setContext("steps", jobContext->mSteps.getObject());
+   exprState->setContext("job", currentJobContext);
+   exprState->setContext("jobs", jobsList); // NOTE: only used in reusable workflows
+   exprState->setContext("steps", stepsList);
    exprState->setContext("runner", runnerInfo);
    exprState->setContext("secrets", ProtoKVToObject(*exprState, currentTask->mTask.secrets()));
    exprState->setContext("needs", needsMap);
-   exprState->setContext("inputs", new ExprMap(exprState)); // NOTE: this might need to be set inside the job?
+   exprState->setContext("inputs", gitContext->getMapKey("inputs").getObject()); // NOTE: only used in reusable workflows
    // NOTE: no matrix info is sent down so these are placeholders for now
    exprState->setContext("strategy", new ExprMap(exprState));
    exprState->setContext("matrix", new ExprMap(exprState));
    
-   std::vector<JobStep*> steps;
-   getTypedObjectsFromArray<JobStep>(jobContext->mSteps.asObject<ExprArray>(), steps);
+   std::vector<JobStepDefinition*> steps;
+   std::vector<JobStepContext*> stepContexts;
+   getTypedObjectsFromArray<JobStepDefinition>(jobDefinition->mSteps.asObject<ExprArray>(), steps);
+   
+   // Create live steps
+   stepContexts.reserve(steps.size());
+   for (JobStepDefinition* def : steps)
+   {
+      if (def->mId.getString() == NULL)
+      {
+         stepContexts.push_back(NULL);
+      }
+      else
+      {
+         JobStepContext* stepCtx = new JobStepContext(exprState);
+         stepContexts.push_back(stepCtx);
+         stepsList->setMapKey(def->mId.getString(), ExprValue().setObject(stepCtx));
+      }
+   }
    
    printf("Running job %s\n", jobName.c_str());
    // Check if job has "if"
-   if (jobContext->mConditional.getString())
+   if (jobDefinition->mConditional.getString())
    {
-      std::string conditional = jobContext->mConditional.getString();
+      std::string conditional = jobDefinition->mConditional.getString();
       ExprValue conditionalValue = exprState->substituteSingleExpression(conditional);
       if (conditionalValue.getBool() == false)
       {
@@ -1461,8 +1562,11 @@ void PerformTask(TaskTracker* currentTask)
    uint32_t stepCount = 0;
    runner::v1::Result jobResult = runner::v1::RESULT_SUCCESS;
    
-   for (JobStep* step : steps)
+   for (size_t i=0; i<steps.size(); i++)
    {
+      JobStepDefinition* step = steps[i];
+      JobStepContext* stepCtx = stepContexts[i];
+      
       // Update context for step
       env->mSlots[2] = step->mEnv.getObject();
       exprState->setContext("inputs", gitContext->getMapKey("event").getObject()->getMapKey("inputs").getObject());
@@ -1477,6 +1581,7 @@ void PerformTask(TaskTracker* currentTask)
          if (conditionalValue.getBool() == false)
          {
             // Skip job
+            stepCtx->mOutcome.setString(*exprState->mStringTable, RunnerResultToString(runner::v1::RESULT_SKIPPED));
             currentTask->log("Step conditional test failed");
             currentTask->endStep(runner::v1::RESULT_SKIPPED);
             stepCount++;
@@ -1490,7 +1595,9 @@ void PerformTask(TaskTracker* currentTask)
       
       snprintf(buffer, sizeof(buffer), "Doing something in step %u...", stepCount);
       currentTask->log(buffer);
-      runner::v1::Result result = step->execute(currentTask);
+      runner::v1::Result result = step->execute(currentTask, stepCtx->mOutputs.asObject<ExprMap>());
+      stepCtx->mOutcome.setString(*exprState->mStringTable, RunnerResultToString(result));
+      stepCtx->mConclusion.setString(*exprState->mStringTable, RunnerResultToString(result));
       
       if (!(result == runner::v1::RESULT_SUCCESS || result == runner::v1::RESULT_SKIPPED) &&
           !step->mContinueOnError.getBool())
@@ -1506,7 +1613,7 @@ void PerformTask(TaskTracker* currentTask)
    }
    
    // Set outputs according to job description
-   ExprMap* outputList = jobContext->mOutputs.asObject<ExprMap>();
+   ExprMap* outputList = jobDefinition->mOutputs.asObject<ExprMap>();
    if (outputList)
    {
       std::vector<std::string> outputKeys;
@@ -1544,9 +1651,12 @@ int main(int argc, char** argv)
    }
    
    ExprFieldObject::registerFieldsForType<BasicContext>();
-   ExprFieldObject::registerFieldsForType<JobContext>();
-   ExprFieldObject::registerFieldsForType<JobStep>();
-   ExprFieldObject::registerFieldsForType<SingleWorkflowContext>();
+   ExprFieldObject::registerFieldsForType<JobDefinition>();
+   ExprFieldObject::registerFieldsForType<JobStepDefinition>();
+   ExprFieldObject::registerFieldsForType<SingleWorkflowDefinition>();
+   ExprFieldObject::registerFieldsForType<JobStepContext>();
+   ExprFieldObject::registerFieldsForType<JobResultContext>();
+   ExprFieldObject::registerFieldsForType<CurrentJobContext>();
    ExprFieldObject::registerFieldsForType<RunnerInfo>();
    
    RunnerState state;

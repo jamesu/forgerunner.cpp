@@ -252,8 +252,6 @@ struct ExprFieldObject : public ExprObject
       return reg;
    }
    
-   std::unordered_map<std::string, FieldRef> mItems;
-   
    ExprFieldObject(ExprState* state);
    
    virtual void clear();
