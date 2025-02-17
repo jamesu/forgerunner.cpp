@@ -407,8 +407,10 @@ struct UnixShellExecutor : public ShellExecutor
 
 // Thread safe util class to handle updating a task.
 // Note that changes are effectively batched until HealthCheck dispatches API calls.
-struct TaskTracker
+class TaskTracker
 {
+public:
+   
    struct LogBatch
    {
       runner::v1::UpdateLogRequest request;
@@ -428,7 +430,8 @@ struct TaskTracker
          return request.index() + request.rows_size();
       }
    };
-   
+ 
+private:
    RunnerState mRunner;
    runner::v1::Task mTask;
    runner::v1::UpdateTaskRequest mNextTaskRequest;
@@ -447,6 +450,8 @@ struct TaskTracker
    std::mutex mJobInfoMutex;
    std::atomic<bool> mFinished;
    std::atomic<bool> mCancelled;
+   
+public:
    
    TaskTracker(const RunnerState& runner, const runner::v1::Task& task, ExprState* state, SingleWorkflowDefinition* ctx)
    {
@@ -468,6 +473,26 @@ struct TaskTracker
    {
       // Cleanup
       delete mHeadLog;
+   }
+   
+   inline ExprState* _getExprState()
+   {
+      return mExprState;
+   }
+   
+   inline runner::v1::Task& _getTask()
+   {
+      return mTask;
+   }
+   
+   inline RunnerState& _getRunner()
+   {
+      return mRunner;
+   }
+   
+   inline SingleWorkflowDefinition* _getWorkflow() const
+   {
+      return mWorkflow;
    }
    
    void beginJob()
@@ -535,6 +560,11 @@ struct TaskTracker
       std::lock_guard<std::mutex> lock(mMutex);
       uint64_t logsToErase = 0;
       
+      if (ack == 0)
+      {
+         ack = mLastLogAck;
+      }
+      
       for (auto itr = mBatchQueue.begin(),
            itrEnd = mBatchQueue.end();
            itr != itrEnd; itr++)
@@ -569,6 +599,8 @@ struct TaskTracker
       clearACKStates(mLastTaskAck);
       clearACKLogs(mLastLogAck);
    }
+   
+private:
    
    void clearACKStates(uint64_t ack)
    {
@@ -615,6 +647,8 @@ struct TaskTracker
          mBatchQueue.erase(eraseStart, eraseEnd);
       }
    }
+   
+public:
    
    void addOutput(std::string& name, const std::string& value)
    {
@@ -679,7 +713,7 @@ struct TaskTracker
    }
    
    // Waits for ACK to match or until error condition reached
-   void waitForLogSync()
+   void _waitForLogSync()
    {
       uint64_t logACK = 1;
       uint64_t taskACK = 2;
@@ -814,7 +848,7 @@ bool HealthCheck(CURL *curl, RunnerState& state, TaskTracker* tracker)
    if (tracker)
    {
       // Send logs
-      TaskTracker::LogBatch* newBatch = tracker->getBatchToSend(tracker->mLastLogAck);
+      TaskTracker::LogBatch* newBatch = tracker->getBatchToSend(0);
       if (newBatch)
       {
          if (QuickRequest(curl, state, "runner.v1.RunnerService/UpdateLog",
@@ -1034,7 +1068,7 @@ struct JobStepDefinition : public BasicContext
       
       
       UnixShellExecutor shellExec(mState);
-      shellExec.mJobID = std::to_string(tracker->mTask.id());
+      shellExec.mJobID = std::to_string(tracker->_getTask().id());
       shellExec.mLogHandler = [tracker](const char* data, size_t len) {
          std::string sdata(data, len);
          tracker->log(sdata.c_str());
@@ -1658,14 +1692,14 @@ void PerformTask(TaskTracker* currentTask)
    currentTask->beginJob();
    
    std::vector<std::string> jobList;
-   currentTask->mWorkflow->mJobs.getObject()->extractKeys(jobList);
+   currentTask->_getWorkflow()->mJobs.getObject()->extractKeys(jobList);
    
    std::string jobName = jobList[0];
-   JobDefinition* jobDefinition = currentTask->mWorkflow->mJobs.asObject<ExprMap>()->getMapKey(jobName).asObject<JobDefinition>();
+   JobDefinition* jobDefinition = currentTask->_getWorkflow()->mJobs.asObject<ExprMap>()->getMapKey(jobName).asObject<JobDefinition>();
    
-   ExprState* exprState = currentTask->mExprState;
+   ExprState* exprState = currentTask->_getExprState();
    ExprMultiKey* env = new ExprMultiKey(exprState);
-   env->mSlots[0] = currentTask->mWorkflow->mEnv.getObject();
+   env->mSlots[0] = currentTask->_getWorkflow()->mEnv.getObject();
    env->mSlots[1] = jobDefinition->mEnv.getObject();
    
    ExprArray* jobsList = new ExprArray(exprState);
@@ -1673,8 +1707,8 @@ void PerformTask(TaskTracker* currentTask)
    CurrentJobContext* currentJobContext = new CurrentJobContext(exprState);
    
    // NOTE: "needs" and "jobs" are basically the same
-   ExprMap* needsMap = new ExprMap(currentTask->mExprState);
-   for (auto itr : currentTask->mTask.needs())
+   ExprMap* needsMap = new ExprMap(currentTask->_getExprState());
+   for (auto itr : currentTask->_getTask().needs())
    {
       ExprMap* outMap = ProtoKVToObject(*exprState, itr.second.outputs());
       JobResultContext* jobCtx = new JobResultContext(exprState);
@@ -1685,19 +1719,19 @@ void PerformTask(TaskTracker* currentTask)
    }
    
    RunnerInfo* runnerInfo = new RunnerInfo(exprState);
-   ExprMap* gitContext = ProtoStructToObject(*exprState, currentTask->mTask.context());
+   ExprMap* gitContext = ProtoStructToObject(*exprState, currentTask->_getTask().context());
    
-   SetRunnerInfoFromProto(*exprState, currentTask->mRunner.info, runnerInfo);
+   SetRunnerInfoFromProto(*exprState, currentTask->_getRunner().info, runnerInfo);
    
    // Setup context for job
    exprState->setContext("github", gitContext);
    exprState->setContext("env", env);
-   exprState->setContext("vars", ProtoKVToObject(*exprState, currentTask->mTask.vars()));
+   exprState->setContext("vars", ProtoKVToObject(*exprState, currentTask->_getTask().vars()));
    exprState->setContext("job", currentJobContext);
    exprState->setContext("jobs", jobsList); // NOTE: only used in reusable workflows
    exprState->setContext("steps", stepsList);
    exprState->setContext("runner", runnerInfo);
-   exprState->setContext("secrets", ProtoKVToObject(*exprState, currentTask->mTask.secrets()));
+   exprState->setContext("secrets", ProtoKVToObject(*exprState, currentTask->_getTask().secrets()));
    exprState->setContext("needs", needsMap);
    exprState->setContext("inputs", gitContext->getMapKey("inputs").getObject()); // NOTE: only used in reusable workflows
    // NOTE: no matrix info is sent down so these are placeholders for now
@@ -1740,7 +1774,7 @@ void PerformTask(TaskTracker* currentTask)
          }
          currentTask->setResult(runner::v1::RESULT_SKIPPED);
          currentTask->log("Job conditional test failed", true);
-         currentTask->waitForLogSync();
+         currentTask->_waitForLogSync();
          //
          currentTask->endJob();
          currentTask->setFinished();
@@ -1840,7 +1874,7 @@ void PerformTask(TaskTracker* currentTask)
    //
    currentTask->setResult(jobResult);
    currentTask->log("End of job reached", true);
-   currentTask->waitForLogSync();
+   currentTask->_waitForLogSync();
    //
    currentTask->endJob();
    currentTask->setFinished();
