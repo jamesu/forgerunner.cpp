@@ -28,7 +28,7 @@ After building, you can run ForgeRunner using:
 ```
 
 ## License
-ForgeRunner is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+ForgeRunner is licensed under the GPLV3 License. See the [LICENSE](LICENSE) file for details.
 
 ## Disclaimer
 This project is **experimental** and not yet ready for production use. Use at your own risk!
