@@ -39,6 +39,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 #include "connectrpc/messages.pb.h"
 
 #include "expressionEval.h"
+#include "subprocess.h"
 
 using ExprValue = ExpressionEval::ExprValue;
 using ExprObject = ExpressionEval::ExprObject;
@@ -223,6 +224,187 @@ void PrintTaskDetails(const runner::v1::Task& task)
 struct JobStepDefinition;
 struct SingleWorkflowDefinition;
 
+void DumpEnv(ExprObject* map, std::vector<std::string> values, std::vector<const char*> valuesChar)
+{
+   map->extractKeys(values);
+   for (size_t i=0; i<values.size(); i++)
+   {
+      ExprValue value = map->getMapKey(values[i]);
+      values[i] = values[i] + std::string("=") + value.getStringSafe();
+      valuesChar.push_back(values[i].c_str());
+   }
+}
+
+#ifdef _WIN32
+    #include <windows.h>
+    #define GET_PID() GetCurrentProcessId()
+#else
+    #include <unistd.h>
+    #define GET_PID() getpid()
+#endif
+
+std::unordered_map<std::string, std::string> ParseEnvFile(const std::string &filename);
+
+struct ShellExecutor
+{
+   ExprState* mState;
+   RunnerState* mRunnerState;
+   std::string mJobID;
+   std::function<void(const char*, std::size_t)> mLogHandler;
+   
+   ShellExecutor(ExprState* state) : mState(state), mRunnerState(NULL)
+   {
+   }
+   
+   virtual runner::v1::Result execute(const std::string& cwd,
+                                      const std::string& shell,
+                                      const std::string& cmdList,
+                                      ExprObject* env,
+                                      ExprObject* outEnv,
+                                      ExprObject* outputs) = 0;
+   
+   virtual ~ShellExecutor()
+   {
+   }
+};
+
+struct UnixShellExecutor : public ShellExecutor
+{
+   struct subprocess_s mSubprocess;
+   
+   UnixShellExecutor(ExprState* state) : ShellExecutor(state)
+   {
+   }
+   
+   runner::v1::Result execute(const std::string& cwd,
+                              const std::string& shell,
+                              const std::string& cmdList,
+                              ExprObject* env,
+                              ExprObject* outEnv,
+                              ExprObject* outputs) override
+   {
+      // Define the file name
+      std::filesystem::path filePath = std::filesystem::temp_directory_path() / (std::to_string(GET_PID()) + "-run-" + mJobID + ".sh");
+      std::filesystem::path outputPath = std::filesystem::temp_directory_path() / (std::to_string(GET_PID()) + "-run-" + mJobID + "-outputs.env");
+      std::filesystem::path envPath = std::filesystem::temp_directory_path() / (std::to_string(GET_PID()) + "-run-" + mJobID + "-env.env");
+      
+      // Load env
+      
+      std::vector<std::string> envS;
+      std::vector<const char*> envC;
+      
+      if (outputs != NULL)
+      {
+         DumpEnv(env, envS, envC);
+      }
+      
+      envC.push_back(NULL);
+      
+      // Write temp script
+      
+      std::ofstream outFile(filePath, std::ios::binary);
+      outFile << "set -e\n";
+      outFile << "cd \"" + cwd + "\"\n";
+      outFile << cmdList;
+      outFile << "\n";
+      outFile.close();
+      std::filesystem::remove(outputPath);
+      std::filesystem::remove(envPath);
+      
+      const char *command_line[] = {shell.c_str(), filePath.c_str(), NULL};
+      int result = subprocess_create_ex(command_line,
+                                        subprocess_option_enable_async |
+                                        subprocess_option_combined_stdout_stderr,
+                                        &envC[0], &mSubprocess);
+      
+      // Poll logs
+      
+      char buffer[4096];
+      const char* curLine = buffer;
+      size_t bytesRead = 0;
+
+      do
+      {
+          buffer[0] = '\0';
+          bytesRead = subprocess_read_stdout(&mSubprocess, buffer, sizeof(buffer)-1);
+          buffer[bytesRead] = '\0';
+
+          // TODO: check if cancelled?
+          if (mLogHandler && bytesRead > 0)
+          {
+              const char* eof = buffer + strlen(buffer);
+              const char* nextLine = curLine;
+
+              while (nextLine < eof)
+              {
+                  // Find the next '\n'
+                  const char* lineEnd = strchr(nextLine, '\n');
+
+                  if (!lineEnd)
+                  {
+                      lineEnd = eof;  // No more newlines, process remaining text
+                  }
+
+                  // Adjust length to strip trailing '\r' if present
+                  size_t lineLength = lineEnd - nextLine;
+                  if (lineLength > 0 && nextLine[lineLength - 1] == '\r')
+                  {
+                      lineLength--;  // Exclude trailing '\r'
+                  }
+
+                  mLogHandler(nextLine, lineLength);
+
+                  // Move past the '\n' if it exists
+                  if (lineEnd < eof)
+                  {
+                      nextLine = lineEnd + 1;
+                  }
+                  else
+                  {
+                      nextLine = eof;
+                  }
+
+                  curLine = nextLine;  // Move cursor forward
+              }
+          }
+      } while (bytesRead != 0);
+      
+      int process_return = 0;
+      subprocess_join(&mSubprocess, &process_return);
+      //subprocess_terminate(&mSubprocess);
+      
+      // Cleanup
+      std::filesystem::remove(filePath);
+      
+      if (std::filesystem::exists(envPath))
+      {
+         // Load env
+         auto kv = ParseEnvFile(envPath);
+         for (auto& itr : kv)
+         {
+            outEnv->setMapKey(itr.first, ExprValue().setString(*mState->mStringTable, itr.second.c_str()));
+         }
+         std::filesystem::remove(envPath);
+      }
+      if (std::filesystem::exists(outputPath))
+      {
+         if (outputs)
+         {
+            // Load output
+            auto kv = ParseEnvFile(outputPath);
+            for (auto& itr : kv)
+            {
+               outputs->setMapKey(itr.first, ExprValue().setString(*mState->mStringTable, itr.second.c_str()));
+            }
+            std::filesystem::remove(outputPath);
+         }
+      }
+      
+      return process_return != 0 ?  runner::v1::RESULT_FAILURE : runner::v1::RESULT_SUCCESS;
+   }
+};
+
+
 // Thread safe util class to handle updating a task.
 // Note that changes are effectively batched until HealthCheck dispatches API calls.
 struct TaskTracker
@@ -247,7 +429,7 @@ struct TaskTracker
       }
    };
    
-   runner::v1::Runner mRunner;
+   RunnerState mRunner;
    runner::v1::Task mTask;
    runner::v1::UpdateTaskRequest mNextTaskRequest;
    runner::v1::StepState* mNextStepState;
@@ -266,7 +448,7 @@ struct TaskTracker
    std::atomic<bool> mFinished;
    std::atomic<bool> mCancelled;
    
-   TaskTracker(const runner::v1::Runner& runner, const runner::v1::Task& task, ExprState* state, SingleWorkflowDefinition* ctx)
+   TaskTracker(const RunnerState& runner, const runner::v1::Task& task, ExprState* state, SingleWorkflowDefinition* ctx)
    {
       mTask = task;
       mRunner = runner;
@@ -840,12 +1022,29 @@ struct JobStepDefinition : public BasicContext
    
    virtual ~JobStepDefinition() = default;
    
-   virtual runner::v1::Result execute(TaskTracker* tracker, ExprMap* outputs)
+   virtual runner::v1::Result execute(TaskTracker* tracker, 
+                                      ExprObject* env,
+                                      ExprObject* outEnv,
+                                      ExprObject* outputs)
    {
       std::string cmdToRun = mState->substituteExpressions(mRun.getStringSafe());
       char buffer[4096];
       snprintf(buffer, sizeof(buffer), "TODO: run %s", cmdToRun.c_str());
       tracker->log(buffer);
+      
+      
+      UnixShellExecutor shellExec(mState);
+      shellExec.mJobID = std::to_string(tracker->mTask.id());
+      shellExec.mLogHandler = [tracker](const char* data, size_t len) {
+         std::string sdata(data, len);
+         tracker->log(sdata.c_str());
+      };
+      
+      std::string cwd = mCwd.getString() ? mCwd.getString() : std::filesystem::current_path().c_str();
+      std::string shell = mShell.getString() ? mShell.getString() : "/bin/bash";
+      
+      shellExec.execute(cwd, shell, cmdToRun, env, outEnv, outputs);
+      
       return runner::v1::RESULT_SUCCESS;
    }
    
@@ -1424,7 +1623,7 @@ TaskTracker* PollForTask(CURL* curl, RunnerState& state)
             return NULL;
          }
 
-         tracker = new TaskTracker(state.info, rspTask.task(), exprState, workFlowContext);
+         tracker = new TaskTracker(state, rspTask.task(), exprState, workFlowContext);
       }
    }
    
@@ -1488,7 +1687,7 @@ void PerformTask(TaskTracker* currentTask)
    RunnerInfo* runnerInfo = new RunnerInfo(exprState);
    ExprMap* gitContext = ProtoStructToObject(*exprState, currentTask->mTask.context());
    
-   SetRunnerInfoFromProto(*exprState, currentTask->mRunner, runnerInfo);
+   SetRunnerInfoFromProto(*exprState, currentTask->mRunner.info, runnerInfo);
    
    // Setup context for job
    exprState->setContext("github", gitContext);
@@ -1581,7 +1780,10 @@ void PerformTask(TaskTracker* currentTask)
          if (conditionalValue.getBool() == false)
          {
             // Skip job
-            stepCtx->mOutcome.setString(*exprState->mStringTable, RunnerResultToString(runner::v1::RESULT_SKIPPED));
+            if (stepCtx)
+            {
+               stepCtx->mOutcome.setString(*exprState->mStringTable, RunnerResultToString(runner::v1::RESULT_SKIPPED));
+            }
             currentTask->log("Step conditional test failed");
             currentTask->endStep(runner::v1::RESULT_SKIPPED);
             stepCount++;
@@ -1595,9 +1797,15 @@ void PerformTask(TaskTracker* currentTask)
       
       snprintf(buffer, sizeof(buffer), "Doing something in step %u...", stepCount);
       currentTask->log(buffer);
-      runner::v1::Result result = step->execute(currentTask, stepCtx->mOutputs.asObject<ExprMap>());
-      stepCtx->mOutcome.setString(*exprState->mStringTable, RunnerResultToString(result));
-      stepCtx->mConclusion.setString(*exprState->mStringTable, RunnerResultToString(result));
+      runner::v1::Result result = step->execute(currentTask,
+                                                env,
+                                                step->mEnv.asObject<ExprMap>(),
+                                                stepCtx ? stepCtx->mOutputs.asObject<ExprMap>() : NULL);
+      if (stepCtx)
+      {
+         stepCtx->mOutcome.setString(*exprState->mStringTable, RunnerResultToString(result));
+         stepCtx->mConclusion.setString(*exprState->mStringTable, RunnerResultToString(result));
+      }
       
       if (!(result == runner::v1::RESULT_SUCCESS || result == runner::v1::RESULT_SKIPPED) &&
           !step->mContinueOnError.getBool())

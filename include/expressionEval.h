@@ -218,7 +218,11 @@ struct ExprMap : public ExprObject
 
 struct ExprMultiKey : public ExprObject
 {
-   ExprObject* mSlots[3];
+   enum
+   {
+      MaxSlots = 4
+   };
+   ExprObject* mSlots[MaxSlots];
    
    ExprMultiKey(ExprState* state);
    virtual ~ExprMultiKey();
@@ -995,6 +999,7 @@ inline void ExprMap::toList(std::vector<ExprValue>& outItems)
 inline void ExprMap::extractKeys(std::vector<std::string>& outItems)
 {
    outItems.clear();
+   outItems.reserve(mItems.size());
    for (const auto& itr : mItems)
    {
       outItems.push_back(itr.first);
