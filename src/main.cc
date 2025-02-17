@@ -52,6 +52,16 @@ using FuncInfo = ExpressionEval::FuncInfo;
 
 using namespace google::protobuf::util;
 
+enum
+{
+   REnv_Core=0,
+   REnv_Workflow=1,
+   REnv_Job=2,
+   REnv_Step=3,
+   REnv_Force,
+   REnv_COUNT
+};
+
 // State to track runner auth and task version
 struct RunnerState
 {
@@ -224,17 +234,6 @@ void PrintTaskDetails(const runner::v1::Task& task)
 struct JobStepDefinition;
 struct SingleWorkflowDefinition;
 
-void DumpEnv(ExprObject* map, std::vector<std::string> values, std::vector<const char*> valuesChar)
-{
-   map->extractKeys(values);
-   for (size_t i=0; i<values.size(); i++)
-   {
-      ExprValue value = map->getMapKey(values[i]);
-      values[i] = values[i] + std::string("=") + value.getStringSafe();
-      valuesChar.push_back(values[i].c_str());
-   }
-}
-
 #ifdef _WIN32
     #include <windows.h>
     #define GET_PID() GetCurrentProcessId()
@@ -256,10 +255,21 @@ struct ShellExecutor
    {
    }
    
+   static void dumpEnv(ExprObject* map, std::vector<std::string>& values, std::vector<const char*>& valuesChar)
+   {
+      map->extractKeys(values);
+      for (size_t i=0; i<values.size(); i++)
+      {
+         ExprValue value = map->getMapKey(values[i]);
+         values[i] = values[i] + std::string("=") + value.getStringSafe();
+         valuesChar.push_back(values[i].c_str());
+      }
+   }
+   
    virtual runner::v1::Result execute(const std::string& cwd,
                                       const std::string& shell,
                                       const std::string& cmdList,
-                                      ExprObject* env,
+                                      ExprMultiKey* env,
                                       ExprObject* outEnv,
                                       ExprObject* outputs) = 0;
    
@@ -279,7 +289,7 @@ struct UnixShellExecutor : public ShellExecutor
    runner::v1::Result execute(const std::string& cwd,
                               const std::string& shell,
                               const std::string& cmdList,
-                              ExprObject* env,
+                              ExprMultiKey* env,
                               ExprObject* outEnv,
                               ExprObject* outputs) override
    {
@@ -288,14 +298,19 @@ struct UnixShellExecutor : public ShellExecutor
       std::filesystem::path outputPath = std::filesystem::temp_directory_path() / (std::to_string(GET_PID()) + "-run-" + mJobID + "-outputs.env");
       std::filesystem::path envPath = std::filesystem::temp_directory_path() / (std::to_string(GET_PID()) + "-run-" + mJobID + "-env.env");
       
+      // Update step env
+      env->mSlots[REnv_Step]->setMapKey("GITHUB_ENV", ExprValue().setString(*mState->mStringTable, envPath.c_str()));
+      env->mSlots[REnv_Step]->setMapKey("GITHUB_OUTPUT", ExprValue().setString(*mState->mStringTable, outputPath.c_str()));
+      env->mSlots[REnv_Step]->setMapKey("GITHUB_PATH", ExprValue().setString(*mState->mStringTable, "")); // TODO
+      
       // Load env
       
       std::vector<std::string> envS;
       std::vector<const char*> envC;
       
-      if (outputs != NULL)
+      if (env != NULL)
       {
-         DumpEnv(env, envS, envC);
+         dumpEnv(env, envS, envC);
       }
       
       envC.push_back(NULL);
@@ -320,54 +335,73 @@ struct UnixShellExecutor : public ShellExecutor
       // Poll logs
       
       char buffer[4096];
-      const char* curLine = buffer;
-      size_t bytesRead = 0;
+      char* curLine = buffer;
+      buffer[0] = '\0';
 
-      do
+      while (true)
       {
-          buffer[0] = '\0';
-          bytesRead = subprocess_read_stdout(&mSubprocess, buffer, sizeof(buffer)-1);
-          buffer[bytesRead] = '\0';
-
-          // TODO: check if cancelled?
-          if (mLogHandler && bytesRead > 0)
+          // Read into the available buffer space
+          size_t bytesAvailable = sizeof(buffer) - 1 - (curLine - buffer);
+          if (bytesAvailable < 0)
           {
-              const char* eof = buffer + strlen(buffer);
-              const char* nextLine = curLine;
-
-              while (nextLine < eof)
-              {
-                  // Find the next '\n'
-                  const char* lineEnd = strchr(nextLine, '\n');
-
-                  if (!lineEnd)
-                  {
-                      lineEnd = eof;  // No more newlines, process remaining text
-                  }
-
-                  // Adjust length to strip trailing '\r' if present
-                  size_t lineLength = lineEnd - nextLine;
-                  if (lineLength > 0 && nextLine[lineLength - 1] == '\r')
-                  {
-                      lineLength--;  // Exclude trailing '\r'
-                  }
-
-                  mLogHandler(nextLine, lineLength);
-
-                  // Move past the '\n' if it exists
-                  if (lineEnd < eof)
-                  {
-                      nextLine = lineEnd + 1;
-                  }
-                  else
-                  {
-                      nextLine = eof;
-                  }
-
-                  curLine = nextLine;  // Move cursor forward
-              }
+             break;
           }
-      } while (bytesRead != 0);
+         
+          size_t bytesRead = subprocess_read_stdout(&mSubprocess, (char*)curLine, (unsigned)bytesAvailable);
+          
+          if (bytesRead <= 0)
+          {
+              break; // No more data to read
+          }
+
+          curLine[bytesRead] = '\0'; // Null-terminate
+          const char* eof = buffer + strlen(buffer);
+          const char* nextLine = buffer;
+
+          printf("DEBUG SUBPROCESS:");
+          fwrite(buffer, bytesRead, 1, stdout);
+          printf("\n");
+
+          while (nextLine < eof)
+          {
+              // Find the next '\n'
+              const char* lineEnd = strchr(nextLine, '\n');
+
+              if (!lineEnd)
+              {
+                  break; // Incomplete line, move remaining bytes to start
+              }
+
+              // Adjust length to strip trailing '\r' if present
+              size_t lineLength = lineEnd - nextLine;
+              if (lineLength > 0 && nextLine[lineLength - 1] == '\r')
+              {
+                  lineLength--; // Exclude trailing '\r'
+              }
+
+              // Emit the log line
+              mLogHandler(nextLine, lineLength);
+
+              // Move past the newline
+              nextLine = lineEnd + 1;
+          }
+
+          // Move leftover data to the start of the buffer
+          size_t remaining = eof - nextLine;
+          if (remaining > 0)
+          {
+              memmove(buffer, nextLine, remaining);
+          }
+          
+          curLine = buffer + remaining; // Update buffer position for next read
+
+          // If buffer is completely full and no newline was found, emit as a full line
+          if (curLine == buffer + sizeof(buffer) - 1)
+          {
+              mLogHandler(buffer, curLine - buffer);
+              curLine = buffer; // Reset buffer
+          }
+      }
       
       int process_return = 0;
       subprocess_join(&mSubprocess, &process_return);
@@ -378,11 +412,14 @@ struct UnixShellExecutor : public ShellExecutor
       
       if (std::filesystem::exists(envPath))
       {
-         // Load env
-         auto kv = ParseEnvFile(envPath);
-         for (auto& itr : kv)
+         if (outEnv)
          {
-            outEnv->setMapKey(itr.first, ExprValue().setString(*mState->mStringTable, itr.second.c_str()));
+            // Load env
+            auto kv = ParseEnvFile(envPath);
+            for (auto& itr : kv)
+            {
+               outEnv->setMapKey(itr.first, ExprValue().setString(*mState->mStringTable, itr.second.c_str()));
+            }
          }
          std::filesystem::remove(envPath);
       }
@@ -982,6 +1019,7 @@ struct BasicContext : public ExprFieldObject
       mTask = NULL;
       mTimeoutMinutes = ExprValue().setNumeric(10);
       mContinueOnError = ExprValue().setBool(false);
+      mEnv.setObject(new ExprMap(mState));
    }
    
    std::string toString() override { return ""; }
@@ -998,7 +1036,7 @@ template<> void ExprFieldObject::registerFieldsForType<BasicContext>()
    registerField<BasicContext>("if", offsetof(BasicContext, mConditional), ExprValue::STRING);
    registerField<BasicContext>("inputs", offsetof(BasicContext, mInputs), ExprValue::OBJECT);
    registerField<BasicContext>("outputs", offsetof(BasicContext, mOutputs), ExprValue::OBJECT);
-   registerField<BasicContext>("env", offsetof(BasicContext, mEnv), ExprValue::OBJECT);
+   registerField<BasicContext>("env", offsetof(BasicContext, mEnv), ExprValue::OBJECT, false);
    registerField<BasicContext>("timeout-minutes", offsetof(BasicContext, mTimeoutMinutes), ExprValue::NUMBER);
    registerField<BasicContext>("continue-on-error", offsetof(BasicContext, mContinueOnError), ExprValue::BOOLEAN);
 }
@@ -1057,7 +1095,7 @@ struct JobStepDefinition : public BasicContext
    virtual ~JobStepDefinition() = default;
    
    virtual runner::v1::Result execute(TaskTracker* tracker, 
-                                      ExprObject* env,
+                                      ExprMultiKey* env,
                                       ExprObject* outEnv,
                                       ExprObject* outputs)
    {
@@ -1683,6 +1721,25 @@ template<class T> void getTypedObjectsFromArray(ExprArray* arr, std::vector<T*>&
    }
 }
 
+ExprObject* EvaluateAllKeys(ExprObject* obj)
+{
+   if (obj == NULL)
+   {
+      return NULL;
+   }
+   std::vector<std::string> keyList;
+   obj->extractKeys(keyList);
+   for (std::string& key : keyList)
+   {
+      ExprValue val = obj->getMapKey(key);
+      if (val.containsExpression())
+      {
+         obj->setMapKey(key, obj->mState->evaluateString(val.getString()));
+      }
+   }
+   return obj;
+}
+
 // Example thread to send dummy updates to the server
 void PerformTask(TaskTracker* currentTask)
 {
@@ -1698,9 +1755,14 @@ void PerformTask(TaskTracker* currentTask)
    JobDefinition* jobDefinition = currentTask->_getWorkflow()->mJobs.asObject<ExprMap>()->getMapKey(jobName).asObject<JobDefinition>();
    
    ExprState* exprState = currentTask->_getExprState();
+   
+   // Set core env
+   ExprMap* coreEnv = new ExprMap(exprState);
+   
    ExprMultiKey* env = new ExprMultiKey(exprState);
-   env->mSlots[0] = currentTask->_getWorkflow()->mEnv.getObject();
-   env->mSlots[1] = jobDefinition->mEnv.getObject();
+   env->mSlots[REnv_Core] = coreEnv;
+   env->mSlots[REnv_Workflow] = EvaluateAllKeys(currentTask->_getWorkflow()->mEnv.getObject());
+   env->mSlots[REnv_Job] = EvaluateAllKeys(jobDefinition->mEnv.getObject());
    
    ExprArray* jobsList = new ExprArray(exprState);
    ExprMap* stepsList = new ExprMap(exprState);
@@ -1737,6 +1799,52 @@ void PerformTask(TaskTracker* currentTask)
    // NOTE: no matrix info is sent down so these are placeholders for now
    exprState->setContext("strategy", new ExprMap(exprState));
    exprState->setContext("matrix", new ExprMap(exprState));
+   
+   // Setup core env
+   ExprObject* ctx = exprState->getContext("github");
+   coreEnv->setMapKey("GITHUB_ACTION",ctx->getMapKey("action"));
+   coreEnv->setMapKey("GITHUB_ACTIONS", ExprValue().setBool(false));
+   coreEnv->setMapKey("GITHUB_ACTOR", ExprValue().setString(*exprState->mStringTable, "unknown"));
+   coreEnv->setMapKey("GITHUB_API_URL",ctx->getMapKey("api_url"));
+   coreEnv->setMapKey("GITHUB_BASE_REF",ctx->getMapKey("base_ref"));
+   coreEnv->setMapKey("GITHUB_EVENT_NAME",ctx->getMapKey("event_name"));
+   coreEnv->setMapKey("GITHUB_EVENT_PATH", ExprValue().setString(*exprState->mStringTable, "")); // TODO?
+   coreEnv->setMapKey("GITHUB_GRAPHQL_URL",ctx->getMapKey("graphql_url"));
+   coreEnv->setMapKey("GITHUB_HEAD_REF",ctx->getMapKey("head_ref"));
+   coreEnv->setMapKey("GITHUB_JOB",ctx->getMapKey("job"));
+   coreEnv->setMapKey("GITHUB_REF",ctx->getMapKey("ref"));
+   coreEnv->setMapKey("GITHUB_REF_NAME",ctx->getMapKey("ref_name"));
+   coreEnv->setMapKey("GITHUB_REF_PROTECTED",ctx->getMapKey("ref_protected").coerceStringValue(*exprState->mStringTable));
+   coreEnv->setMapKey("GITHUB_REF_TYPE",ctx->getMapKey("ref_type"));
+   coreEnv->setMapKey("GITHUB_REPOSITORY",ctx->getMapKey("repository"));
+   coreEnv->setMapKey("GITHUB_REPOSITORY_ID",ctx->getMapKey("repository_id"));
+   coreEnv->setMapKey("GITHUB_REPOSITORY_OWNER",ctx->getMapKey("repository_owner"));
+   coreEnv->setMapKey("GITHUB_REPOSITORY_OWNER_ID",ctx->getMapKey("repository_owner_id"));
+   coreEnv->setMapKey("GITHUB_RETENTION_DAYS", ExprValue().setString(*exprState->mStringTable, "0")); // TODO
+   coreEnv->setMapKey("GITHUB_RUN_ATTEMPT",ctx->getMapKey("run_attempt"));
+   coreEnv->setMapKey("GITHUB_RUN_ID",ctx->getMapKey("run_id"));
+   coreEnv->setMapKey("GITHUB_RUN_NUMBER",ctx->getMapKey("run_number"));
+   coreEnv->setMapKey("GITHUB_SERVER_URL",ctx->getMapKey("server_url"));
+   coreEnv->setMapKey("GITHUB_SHA",ctx->getMapKey("sha"));
+   coreEnv->setMapKey("GITHUB_STEP_SUMMARY",ExprValue().setString(*exprState->mStringTable, "")); // TODO
+   coreEnv->setMapKey("GITHUB_TOKEN",ctx->getMapKey("token"));
+   coreEnv->setMapKey("GITHUB_TRIGGERING_ACTOR",ctx->getMapKey("triggering_actor"));
+   coreEnv->setMapKey("GITHUB_WORKFLOW",ctx->getMapKey("workflow"));
+   coreEnv->setMapKey("GITHUB_WORKSPACE",ExprValue().setString(*exprState->mStringTable, "")); // TODO
+   
+   
+   ExprObject* runnerCtx = exprState->getContext("runner");
+   coreEnv->setMapKey("RUNNER_ARCH", runnerCtx->getMapKey("arch"));
+   coreEnv->setMapKey("RUNNER_DEBUG", runnerCtx->getMapKey("debug").coerceStringValue(*exprState->mStringTable));
+   coreEnv->setMapKey("RUNNER_NAME", ExprValue().setString(*exprState->mStringTable, "unknown"));
+   coreEnv->setMapKey("RUNNER_OS", runnerCtx->getMapKey("os"));
+   coreEnv->setMapKey("RUNNER_TEMP", runnerCtx->getMapKey("temp"));
+   coreEnv->setMapKey("RUNNER_TOOL_CACHE", runnerCtx->getMapKey("tool_cache"));
+   
+   coreEnv->setMapKey("CI", ExprValue().setString(*exprState->mStringTable, "true"));
+   
+   
+   //coreEnv->setMapKey("GITHUB_ENV", ExprValue().setString(*exprState->mStringTable, ctx->getMapKey("base_ref")));
    
    std::vector<JobStepDefinition*> steps;
    std::vector<JobStepContext*> stepContexts;
@@ -1801,7 +1909,7 @@ void PerformTask(TaskTracker* currentTask)
       JobStepContext* stepCtx = stepContexts[i];
       
       // Update context for step
-      env->mSlots[2] = step->mEnv.getObject();
+      env->mSlots[REnv_Step] = step->mEnv.getObject();
       exprState->setContext("inputs", gitContext->getMapKey("event").getObject()->getMapKey("inputs").getObject());
       
       currentTask->beginStep(stepCount);
@@ -1829,11 +1937,13 @@ void PerformTask(TaskTracker* currentTask)
          }
       }
       
+      EvaluateAllKeys(dynamic_cast<ExprMap*>(step->mEnv.getObject())); // resolve keys for STEP
+      
       snprintf(buffer, sizeof(buffer), "Doing something in step %u...", stepCount);
       currentTask->log(buffer);
       runner::v1::Result result = step->execute(currentTask,
                                                 env,
-                                                step->mEnv.asObject<ExprMap>(),
+                                                env->mSlots[REnv_Job],
                                                 stepCtx ? stepCtx->mOutputs.asObject<ExprMap>() : NULL);
       if (stepCtx)
       {

@@ -117,8 +117,10 @@ struct ExprValue
    inline bool isBool() const { return !isNumber() && (value & TAG_MASK) == BOOLEAN; }
    inline bool isString() const { return !isNumber() && (value & TAG_MASK) == STRING; }
    inline bool isObject() const { return !isNumber() && (value & TAG_MASK) == OBJECT; }
+   inline bool containsExpression() const { return isString() && strstr(getString(), "${{") != NULL; }
    
    const char* coerceString(StringTable& st) const;
+   ExprValue coerceStringValue(StringTable& st) const;
    
    bool testEq(const ExprValue& other) const;
 };
@@ -220,7 +222,7 @@ struct ExprMultiKey : public ExprObject
 {
    enum
    {
-      MaxSlots = 4
+      MaxSlots = 5
    };
    ExprObject* mSlots[MaxSlots];
    
@@ -695,6 +697,14 @@ const char* ExprValue::coerceString(StringTable& st) const
    }
 }
 
+ExprValue ExprValue::coerceStringValue(StringTable& st) const
+{
+   const char* val = coerceString(st);
+   ExprValue newVal;
+   newVal.value = ExprValue::NAN_MASK | ExprValue::STRING | ((uint64_t)(uintptr_t)val & PAYLOAD_MASK);
+   return newVal;
+}
+
 inline bool ExprValue::testEq(const ExprValue& other) const
 {
    if ((value & (ExprValue::TAG_MASK | ExprValue::NAN_MASK)) == (other.value & (ExprValue::TAG_MASK | ExprValue::NAN_MASK)))
@@ -1055,7 +1065,7 @@ inline ExprValue ExprMultiKey::getArrayIndex(uint32_t index)
 
 inline ExprValue ExprMultiKey::getMapKey(std::string key)
 {
-   for (int i=2; i>=0; i--)
+   for (int i=ExprMultiKey::MaxSlots-1; i>=0; i--)
    {
       if (mSlots[i] == NULL)
       {
@@ -1083,30 +1093,28 @@ inline void ExprMultiKey::toList(std::vector<ExprValue>& outItems)
 inline void ExprMultiKey::extractKeys(std::vector<std::string>& outKeys)
 {
    std::set<std::string> keyList;
-   std::vector<std::string> newKeys;
    
-   for (int i=2; i>=0; i--)
+   for (int i=ExprMultiKey::MaxSlots-1; i>=0; i--)
    {
       if (mSlots[i] == NULL)
       {
          continue;
       }
       
-      mSlots[i]->extractKeys(newKeys);
+      outKeys.clear();
+      mSlots[i]->extractKeys(outKeys);
       
-      for (std::string& key : newKeys)
+      for (std::string& key : outKeys)
       {
          keyList.insert(key);
       }
    }
    
-   newKeys.clear();
+   outKeys.clear();
    for (const std::string& itr : keyList)
    {
-      newKeys.push_back(itr);
+      outKeys.push_back(itr);
    }
-   
-   return newKeys;
 }
 
 inline std::string ExprMultiKey::toString()
