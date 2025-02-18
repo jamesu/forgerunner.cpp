@@ -261,7 +261,18 @@ struct ShellExecutor
       for (size_t i=0; i<values.size(); i++)
       {
          ExprValue value = map->getMapKey(values[i]);
-         values[i] = values[i] + std::string("=") + value.getStringSafe();
+         if (value.isBool())
+         {
+            values[i] = values[i] + std::string("=") + (value.getBool() ? "true" : "false");
+         }
+         else if (value.isString())
+         {
+            values[i] = values[i] + std::string("=") + value.getString();
+         }
+         else
+         {
+            values[i] = values[i] + std::string("=") + std::to_string(value.getNumber());
+         }
          valuesChar.push_back(values[i].c_str());
       }
    }
