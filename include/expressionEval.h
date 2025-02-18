@@ -646,15 +646,15 @@ inline bool ExprValue::getBool() const
 
 inline float64_t ExprValue::getNumber() const
 {
-   if ((value & ExprValue::STRING) != 0)
+   if ((value & (ExprValue::NAN_MASK | ExprValue::STRING)) == (ExprValue::NAN_MASK | ExprValue::STRING))
    {
-      return std::stold(getString());
+      return getString() ? std::stold(getString()) : 0;
    }
-   else if ((value & ExprValue::BOOLEAN) != 0)
+   else if ((value & (ExprValue::NAN_MASK | ExprValue::BOOLEAN)) == (ExprValue::NAN_MASK | ExprValue::BOOLEAN))
    {
       return getBool() ? 1.0 : 0.0;
    }
-   else if ((value & ExprValue::OBJECT) != 0)
+   else if ((value & (ExprValue::NAN_MASK | ExprValue::OBJECT)) == (ExprValue::NAN_MASK | ExprValue::OBJECT))
    {
       return getObject() ? std::numeric_limits<float64_t>::quiet_NaN() : 0.0;
    }

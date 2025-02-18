@@ -1825,10 +1825,10 @@ void PerformTask(TaskTracker* currentTask)
    coreEnv->setMapKey("GITHUB_JOB",ctx->getMapKey("job"));
    coreEnv->setMapKey("GITHUB_REF",ctx->getMapKey("ref"));
    coreEnv->setMapKey("GITHUB_REF_NAME",ctx->getMapKey("ref_name"));
-   coreEnv->setMapKey("GITHUB_REF_PROTECTED",ctx->getMapKey("ref_protected").coerceStringValue(*exprState->mStringTable));
+   coreEnv->setMapKey("GITHUB_REF_PROTECTED",ctx->getMapKey("ref_protected"));
    coreEnv->setMapKey("GITHUB_REF_TYPE",ctx->getMapKey("ref_type"));
    coreEnv->setMapKey("GITHUB_REPOSITORY",ctx->getMapKey("repository"));
-   coreEnv->setMapKey("GITHUB_REPOSITORY_ID",ctx->getMapKey("repository_id"));
+   coreEnv->setMapKey("GITHUB_REPOSITORY_ID",ctx->getMapKey("event").getObject()->getMapKey("repository").getObject()->getMapKey("id"));
    coreEnv->setMapKey("GITHUB_REPOSITORY_OWNER",ctx->getMapKey("repository_owner"));
    coreEnv->setMapKey("GITHUB_REPOSITORY_OWNER_ID",ctx->getMapKey("repository_owner_id"));
    coreEnv->setMapKey("GITHUB_RETENTION_DAYS", ExprValue().setString(*exprState->mStringTable, "0")); // TODO
@@ -1841,7 +1841,7 @@ void PerformTask(TaskTracker* currentTask)
    coreEnv->setMapKey("GITHUB_TOKEN",ctx->getMapKey("token"));
    coreEnv->setMapKey("GITHUB_TRIGGERING_ACTOR",ctx->getMapKey("triggering_actor"));
    coreEnv->setMapKey("GITHUB_WORKFLOW",ctx->getMapKey("workflow"));
-   coreEnv->setMapKey("GITHUB_WORKSPACE",ExprValue().setString(*exprState->mStringTable, "")); // TODO
+   coreEnv->setMapKey("GITHUB_WORKSPACE",ctx->getMapKey("workspace"));
    
    
    ExprObject* runnerCtx = exprState->getContext("runner");
