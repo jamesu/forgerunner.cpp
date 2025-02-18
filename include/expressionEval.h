@@ -1318,16 +1318,24 @@ inline ArrayAccessNode::ArrayAccessNode(ExprNode* array, ExprNode* index)
 inline ExprValue ArrayAccessNode::evaluate(ExprState& state)
 {
    ExprValue index = mIndex->evaluate(state);
-   if (!index.isNumber())
-   {
-      throw std::runtime_error("Array accessor is not numeric");
-   }
    ExprObject* arrayObject = mArray->evaluate(state).getObject();
    if (arrayObject == NULL)
    {
       throw std::runtime_error("Array object is not present");
    }
-   return arrayObject->getArrayIndex((uint32_t)index.getNumber());
+   if (index.isString())
+   {
+      return arrayObject->getMapKey(index.getString());
+   }
+   else if (index.isNumber())
+   {
+      return arrayObject->getArrayIndex((uint32_t)index.getNumber());
+   }
+   else
+   {
+      throw std::runtime_error("Array accessor is not numeric or string");
+   }
+   return ExprValue();
 }
 
 inline IdentifierNode::IdentifierNode(std::string name) : mName(std::move(name))
