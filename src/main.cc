@@ -1183,7 +1183,7 @@ struct JobStepContext : public ExprFieldObject
    
    JobStepContext(ExprState* state);
    
-   std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<JobResultContext>(); }
+   std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<JobStepContext>(); }
 };
 
 template<> void ExprFieldObject::registerFieldsForType<JobStepContext>()
@@ -1941,10 +1941,12 @@ void PerformTask(TaskTracker* currentTask)
       
       snprintf(buffer, sizeof(buffer), "Doing something in step %u...", stepCount);
       currentTask->log(buffer);
+      
+      ExprMap* stepMap = stepCtx ? stepCtx->mOutputs.asObject<ExprMap>() : NULL;
       runner::v1::Result result = step->execute(currentTask,
                                                 env,
                                                 env->mSlots[REnv_Job],
-                                                stepCtx ? stepCtx->mOutputs.asObject<ExprMap>() : NULL);
+                                                stepMap);
       if (stepCtx)
       {
          stepCtx->mOutcome.setString(*exprState->mStringTable, RunnerResultToString(result));
