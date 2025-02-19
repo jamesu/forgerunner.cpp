@@ -1878,112 +1878,210 @@ void SetupExprState(TaskTracker* currentTask, ExprState* exprState)
    //coreEnv->setMapKey("GITHUB_ENV", ExprValue().setString(*exprState->mStringTable, gitContext->getMapKey("base_ref")));
 }
 
-void PerformTaskSteps(TaskTracker* currentTask, ExprState* exprState, StepState& stepState, std::string& jobName)
+class JobExecutor
 {
-   char buffer[4096];
+public:
+   ExprState* mState;
+   JobDefinition* mJob;
+   std::string mJobName;
+   TaskTracker* mTask;
+   int32_t mCurrentStep;
+   int32_t mNumSteps;
    
-   ExprMap* gitContext = (ExprMap*)exprState->getContext("github");
-   
-   // SETUP DONE
-   snprintf(buffer, sizeof(buffer), "Performing %i tasks for job %s...", (int)stepState.steps.size(), jobName.c_str());
-   currentTask->log(buffer);
-  
-   //getTypedObjectsFromArray
-   uint32_t stepCount = 0;
-   runner::v1::Result jobResult = runner::v1::RESULT_SUCCESS;
-   
-   for (size_t i=0; i<stepState.steps.size(); i++)
+   JobExecutor() : mState(NULL), mJob(NULL), mTask(NULL), mCurrentStep(0), mNumSteps(0)
    {
-      JobStepDefinition* step = stepState.steps[i];
-      JobStepContext* stepCtx = stepState.stepContexts[i];
-      
-      // Update context for step
-      stepState.env->mSlots[REnv_Step] = step->mEnv.getObject();
-      exprState->setContext("inputs", gitContext->getMapKey("event").getObject()->getMapKey("inputs").getObject());
-      
-      currentTask->beginStep(stepCount);
-      
-      // Check if step has "if"
-      if (step->mConditional.getString())
+   }
+   
+   virtual ~JobExecutor()
+   {
+   }
+   
+   void finishTask(runner::v1::Result result, const char* endMessage)
+   {
+      // Skip
+      for (int i=mCurrentStep; i<mNumSteps; i++)
       {
-         std::string conditional = step->mConditional.getString();
-         ExprValue conditionalValue = exprState->substituteSingleExpression(conditional);
+         if (i < 0)
+         {
+            continue;
+         }
+         mTask->beginStep(i);
+         mTask->endStep(result);
+      }
+      mTask->setResult(result);
+      mTask->log(endMessage, true);
+      mTask->_waitForLogSync();
+   }
+   
+   virtual void handleJob() = 0;
+   
+   typedef std::function<JobExecutor*()> CreateFunc;
+   
+   template<class T> static T* createExecutor() { return new T(); }
+   
+    static void registerExecutor(const std::string& key, CreateFunc createFunc)
+    {
+        getRegistry()[key] = createFunc;
+    }
+
+    static CreateFunc getExecutor(const std::string& key)
+    {
+        auto& registry = getRegistry();
+        return registry.count(key) ? registry[key] : registry["default"];
+    }
+
+private:
+   
+    static std::unordered_map<std::string, CreateFunc>& getRegistry()
+    {
+        static std::unordered_map<std::string, CreateFunc> registry;
+        return registry;
+    }
+};
+
+class StandardJobExecutor : public JobExecutor
+{
+public:
+   virtual void handleJob()
+   {
+      SetupExprState(mTask, mState);
+      
+      // Gen step contexts
+      StepState stepState;
+      stepState.stepsMap = (ExprMap*)mState->getContext("steps");
+      stepState.env = (ExprMultiKey*)mState->getContext("env");
+      stepState.outputMap = mJob->mOutputs.asObject<ExprMap>();
+      GetStepStateSteps(mState, mJob->mSteps.asObject<ExprArray>(), stepState);
+      
+      mCurrentStep = 0;
+      mNumSteps = (int32_t)stepState.steps.size();
+      
+      // Make sure we have job env set...
+      stepState.env->mSlots[REnv_Job] = EvaluateAllKeys(mJob->mEnv.getObject());
+      
+      printf("Running job %s\n", mJobName.c_str());
+      // Check if job has "if"
+      if (mJob->mConditional.getString())
+      {
+         std::string conditional = mJob->mConditional.getString();
+         ExprValue conditionalValue = mState->substituteSingleExpression(conditional);
          if (conditionalValue.getBool() == false)
          {
-            // Skip job
-            if (stepCtx)
-            {
-               stepCtx->mOutcome.setString(*exprState->mStringTable, RunnerResultToString(runner::v1::RESULT_SKIPPED));
-            }
-            currentTask->log("Step conditional test failed");
-            currentTask->endStep(runner::v1::RESULT_SKIPPED);
-            stepCount++;
-            continue;
+            finishTask(runner::v1::RESULT_SKIPPED, "Job conditional test failed");
+            return;
          }
          else
          {
-            currentTask->log("Step conditional test passed");
+            mTask->log("Job conditional test passed");
          }
       }
       
-      EvaluateAllKeys(dynamic_cast<ExprMap*>(step->mEnv.getObject())); // resolve keys for STEP
-      
-      snprintf(buffer, sizeof(buffer), "Doing something in step %u...", stepCount);
-      currentTask->log(buffer);
-      
-      ExprMap* stepMap = stepCtx ? stepCtx->mOutputs.asObject<ExprMap>() : NULL;
-      runner::v1::Result result = step->execute(currentTask,
-                                                stepState.env,
-                                                stepState.env->mSlots[REnv_Job],
-                                                stepMap);
-      if (stepCtx)
-      {
-         stepCtx->mOutcome.setString(*exprState->mStringTable, RunnerResultToString(result));
-         stepCtx->mConclusion.setString(*exprState->mStringTable, RunnerResultToString(result));
-      }
-      
-      if (!(result == runner::v1::RESULT_SUCCESS || result == runner::v1::RESULT_SKIPPED) &&
-          !step->mContinueOnError.getBool())
-      {
-         jobResult = result;
-         currentTask->endStep(result);
-         break;
-      }
-      
-      sleep(1);
-      currentTask->endStep(result);
-      stepCount++;
+      performTaskSteps(stepState);
    }
    
-   // Set outputs according to job description
-   if (stepState.outputMap)
+   void performTaskSteps(StepState& stepState)
    {
-      std::vector<std::string> outputKeys;
-      stepState.outputMap->extractKeys(outputKeys);
-      for (std::string& key : outputKeys)
+      char buffer[4096];
+      
+      ExprMap* gitContext = (ExprMap*)mState->getContext("github");
+      
+      // SETUP DONE
+      snprintf(buffer, sizeof(buffer), "Performing %i tasks for job %s...", (int)stepState.steps.size(), mJobName.c_str());
+      mTask->log(buffer);
+     
+      //getTypedObjectsFromArray
+      uint32_t stepCount = 0;
+      runner::v1::Result jobResult = runner::v1::RESULT_SUCCESS;
+      
+      for (size_t i=0; i<stepState.steps.size(); i++)
       {
-         ExprValue val = stepState.outputMap->getMapKey(key);
-         if (val.isString())
+         JobStepDefinition* step = stepState.steps[i];
+         JobStepContext* stepCtx = stepState.stepContexts[i];
+         
+         // Update context for step
+         stepState.env->mSlots[REnv_Step] = step->mEnv.getObject();
+         mState->setContext("inputs", gitContext->getMapKey("event").getObject()->getMapKey("inputs").getObject());
+         
+         mTask->beginStep(stepCount);
+         
+         // Check if step has "if"
+         if (step->mConditional.getString())
          {
-            std::string outputData = exprState->substituteExpressions(val.getString());
-            currentTask->addOutput(key, outputData.c_str());
+            std::string conditional = step->mConditional.getString();
+            ExprValue conditionalValue = mState->substituteSingleExpression(conditional);
+            if (conditionalValue.getBool() == false)
+            {
+               // Skip job
+               if (stepCtx)
+               {
+                  stepCtx->mOutcome.setString(*mState->mStringTable, RunnerResultToString(runner::v1::RESULT_SKIPPED));
+               }
+               mTask->log("Step conditional test failed");
+               mTask->endStep(runner::v1::RESULT_SKIPPED);
+               stepCount++;
+               continue;
+            }
+            else
+            {
+               mTask->log("Step conditional test passed");
+            }
+         }
+         
+         EvaluateAllKeys(dynamic_cast<ExprMap*>(step->mEnv.getObject())); // resolve keys for STEP
+         
+         snprintf(buffer, sizeof(buffer), "Doing something in step %u...", stepCount);
+         mTask->log(buffer);
+         
+         ExprMap* stepMap = stepCtx ? stepCtx->mOutputs.asObject<ExprMap>() : NULL;
+         runner::v1::Result result = step->execute(mTask,
+                                                   stepState.env,
+                                                   stepState.env->mSlots[REnv_Job],
+                                                   stepMap);
+         if (stepCtx)
+         {
+            stepCtx->mOutcome.setString(*mState->mStringTable, RunnerResultToString(result));
+            stepCtx->mConclusion.setString(*mState->mStringTable, RunnerResultToString(result));
+         }
+         
+         if (!(result == runner::v1::RESULT_SUCCESS || result == runner::v1::RESULT_SKIPPED) &&
+             !step->mContinueOnError.getBool())
+         {
+            jobResult = result;
+            mTask->endStep(result);
+            break;
+         }
+         
+         sleep(1);
+         mTask->endStep(result);
+         stepCount++;
+      }
+      
+      // Set outputs according to job description
+      if (stepState.outputMap)
+      {
+         std::vector<std::string> outputKeys;
+         stepState.outputMap->extractKeys(outputKeys);
+         for (std::string& key : outputKeys)
+         {
+            ExprValue val = stepState.outputMap->getMapKey(key);
+            if (val.isString())
+            {
+               std::string outputData = mState->substituteExpressions(val.getString());
+               mTask->addOutput(key, outputData.c_str());
+            }
          }
       }
+      
+      //
+      mTask->setResult(jobResult);
+      mTask->log("End of job reached", true);
+      mTask->_waitForLogSync();
    }
-   
-   //
-   currentTask->setResult(jobResult);
-   currentTask->log("End of job reached", true);
-   currentTask->_waitForLogSync();
-   //
-   currentTask->endJob();
-   currentTask->setFinished();
-}
+};
 
-// Example thread to send dummy updates to the server
 void PerformTask(TaskTracker* currentTask)
 {
-   // SETUP
+   ExprState* exprState = currentTask->_getExprState();
    currentTask->beginJob();
    
    std::vector<std::string> jobList;
@@ -1992,48 +2090,35 @@ void PerformTask(TaskTracker* currentTask)
    std::string jobName = jobList[0];
    JobDefinition* jobDefinition = currentTask->_getWorkflow()->mJobs.asObject<ExprMap>()->getMapKey(jobName).asObject<JobDefinition>();
    
-   ExprState* exprState = currentTask->_getExprState();
-   SetupExprState(currentTask, exprState);
-   
-   // Gen step contexts
-   StepState stepState;
-   stepState.stepsMap = (ExprMap*)exprState->getContext("steps");
-   stepState.env = (ExprMultiKey*)exprState->getContext("env");
-   stepState.outputMap = jobDefinition->mOutputs.asObject<ExprMap>();
-   GetStepStateSteps(exprState, jobDefinition->mSteps.asObject<ExprArray>(), stepState);
-   
-   // Make sure we have job env set...
-   stepState.env->mSlots[REnv_Job] = EvaluateAllKeys(jobDefinition->mEnv.getObject());
-   
-   printf("Running job %s\n", jobName.c_str());
-   // Check if job has "if"
-   if (jobDefinition->mConditional.getString())
+   const char* jobUses = jobDefinition->mUses.getString();
+   if (jobUses == NULL)
    {
-      std::string conditional = jobDefinition->mConditional.getString();
-      ExprValue conditionalValue = exprState->substituteSingleExpression(conditional);
-      if (conditionalValue.getBool() == false)
-      {
-         // Skip job
-         for (int i=0; i<stepState.steps.size(); i++)
-         {
-            currentTask->beginStep(i);
-            currentTask->endStep(runner::v1::RESULT_SKIPPED);
-         }
-         currentTask->setResult(runner::v1::RESULT_SKIPPED);
-         currentTask->log("Job conditional test failed", true);
-         currentTask->_waitForLogSync();
-         //
-         currentTask->endJob();
-         currentTask->setFinished();
-         return;
-      }
-      else
-      {
-         currentTask->log("Job conditional test passed");
-      }
+      jobUses = "default";
    }
    
-   PerformTaskSteps(currentTask, exprState, stepState, jobName);
+   JobExecutor::CreateFunc executorFunc = JobExecutor::getExecutor(jobUses);
+   if (executorFunc == NULL)
+   {
+      std::string err = std::string("Error: couldn't find executor: ") + jobUses;
+      currentTask->setResult(runner::v1::RESULT_FAILURE);
+      currentTask->log(err.c_str(), true);
+      currentTask->_waitForLogSync();
+   }
+   else
+   {
+      JobExecutor* executor = executorFunc();
+      executor->mState = exprState;
+      executor->mJob = jobDefinition;
+      executor->mJobName = jobName;
+      executor->mTask = currentTask;
+      executor->mCurrentStep = 0;
+      executor->mNumSteps = 0;
+      executor->handleJob();
+      delete executor;
+   }
+   
+   currentTask->endJob();
+   currentTask->setFinished();
 }
 
 std::unordered_map<std::string, FuncInfo> ExprState::smFunctions;
@@ -2056,6 +2141,8 @@ int main(int argc, char** argv)
    ExprFieldObject::registerFieldsForType<JobResultContext>();
    ExprFieldObject::registerFieldsForType<CurrentJobContext>();
    ExprFieldObject::registerFieldsForType<RunnerInfo>();
+   
+   JobExecutor::registerExecutor("default", JobExecutor::createExecutor<StandardJobExecutor>);
    
    RunnerState state;
    state.tasks_version = 0;
