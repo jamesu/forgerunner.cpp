@@ -1072,6 +1072,8 @@ struct JobDefinition : public BasicContext
    ExprValue mRunsOn;
    ExprValue mConcurrencyGroup;
    
+   ExprValue mSecrets;
+   
    JobDefinition(ExprState* state);
    std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<JobDefinition>(); }
 };
@@ -1089,7 +1091,9 @@ template<> void ExprFieldObject::registerFieldsForType<JobDefinition>()
    registerField<JobDefinition>("needs", offsetof(JobDefinition, mNeeds), ExprValue::OBJECT);
    registerField<JobDefinition>("runs-on", offsetof(JobDefinition, mRunsOn), ExprValue::STRING);
    registerField<JobDefinition>("concurrency-group", offsetof(JobDefinition, mConcurrencyGroup), ExprValue::STRING);
+   registerField<JobDefinition>("secrets", offsetof(JobDefinition, mSecrets), ExprValue::OBJECT, false);
 }
+
 
 struct JobStepDefinition : public BasicContext
 {
@@ -1751,36 +1755,55 @@ ExprObject* EvaluateAllKeys(ExprObject* obj)
    return obj;
 }
 
-// Example thread to send dummy updates to the server
-void PerformTask(TaskTracker* currentTask)
+struct StepState
 {
-   char buffer[512];
+   std::vector<JobStepDefinition*> steps;
+   std::vector<JobStepContext*> stepContexts;
+   ExprMap* stepsMap;
+   ExprMap* outputMap;
+   ExprMultiKey* env;
+};
+
+void GetStepStateSteps(ExprState* exprState, ExprArray* stepList, StepState& state)
+{
+   getTypedObjectsFromArray<JobStepDefinition>(stepList, state.steps);
    
-   // SETUP
-   currentTask->beginJob();
-   
-   std::vector<std::string> jobList;
-   currentTask->_getWorkflow()->mJobs.getObject()->extractKeys(jobList);
-   
-   std::string jobName = jobList[0];
-   JobDefinition* jobDefinition = currentTask->_getWorkflow()->mJobs.asObject<ExprMap>()->getMapKey(jobName).asObject<JobDefinition>();
-   
-   ExprState* exprState = currentTask->_getExprState();
-   
+   // Create live steps
+   state.stepContexts.reserve(state.steps.size());
+   for (JobStepDefinition* def : state.steps)
+   {
+      if (def->mId.getString() == NULL)
+      {
+         state.stepContexts.push_back(NULL);
+      }
+      else
+      {
+         JobStepContext* stepCtx = new JobStepContext(exprState);
+         state.stepContexts.push_back(stepCtx);
+         state.stepsMap->setMapKey(def->mId.getString(), ExprValue().setObject(stepCtx));
+      }
+   }
+}
+
+void SetupExprState(TaskTracker* currentTask, ExprState* exprState)
+{
    // Set core env
+   ExprMap* needsMap = new ExprMap(exprState);
    ExprMap* coreEnv = new ExprMap(exprState);
-   
    ExprMultiKey* env = new ExprMultiKey(exprState);
-   env->mSlots[REnv_Core] = coreEnv;
-   env->mSlots[REnv_Workflow] = EvaluateAllKeys(currentTask->_getWorkflow()->mEnv.getObject());
-   env->mSlots[REnv_Job] = EvaluateAllKeys(jobDefinition->mEnv.getObject());
-   
    ExprArray* jobsList = new ExprArray(exprState);
    ExprMap* stepsList = new ExprMap(exprState);
+   RunnerInfo* runnerInfo = new RunnerInfo(exprState);
    CurrentJobContext* currentJobContext = new CurrentJobContext(exprState);
+   ExprMap* gitContext = NULL;
+   ExprObject* runnerCtx = NULL;
+   
+   // Set env...
+   env->mSlots[REnv_Core] = coreEnv;
+   env->mSlots[REnv_Workflow] = EvaluateAllKeys(currentTask->_getWorkflow()->mEnv.getObject());
+   
    
    // NOTE: "needs" and "jobs" are basically the same
-   ExprMap* needsMap = new ExprMap(currentTask->_getExprState());
    for (auto itr : currentTask->_getTask().needs())
    {
       ExprMap* outMap = ProtoKVToObject(*exprState, itr.second.outputs());
@@ -1791,8 +1814,7 @@ void PerformTask(TaskTracker* currentTask)
       jobsList->addArrayValue(ExprValue().setObject(jobCtx));
    }
    
-   RunnerInfo* runnerInfo = new RunnerInfo(exprState);
-   ExprMap* gitContext = ProtoStructToObject(*exprState, currentTask->_getTask().context());
+   gitContext = ProtoStructToObject(*exprState, currentTask->_getTask().context());
    
    SetRunnerInfoFromProto(*exprState, currentTask->_getRunner().info, runnerInfo);
    
@@ -1812,39 +1834,38 @@ void PerformTask(TaskTracker* currentTask)
    exprState->setContext("matrix", new ExprMap(exprState));
    
    // Setup core env
-   ExprObject* ctx = exprState->getContext("github");
-   coreEnv->setMapKey("GITHUB_ACTION",ctx->getMapKey("action"));
+   coreEnv->setMapKey("GITHUB_ACTION",gitContext->getMapKey("action"));
    coreEnv->setMapKey("GITHUB_ACTIONS", ExprValue().setBool(false));
    coreEnv->setMapKey("GITHUB_ACTOR", ExprValue().setString(*exprState->mStringTable, "unknown"));
-   coreEnv->setMapKey("GITHUB_API_URL",ctx->getMapKey("api_url"));
-   coreEnv->setMapKey("GITHUB_BASE_REF",ctx->getMapKey("base_ref"));
-   coreEnv->setMapKey("GITHUB_EVENT_NAME",ctx->getMapKey("event_name"));
+   coreEnv->setMapKey("GITHUB_API_URL",gitContext->getMapKey("api_url"));
+   coreEnv->setMapKey("GITHUB_BASE_REF",gitContext->getMapKey("base_ref"));
+   coreEnv->setMapKey("GITHUB_EVENT_NAME",gitContext->getMapKey("event_name"));
    coreEnv->setMapKey("GITHUB_EVENT_PATH", ExprValue().setString(*exprState->mStringTable, "")); // TODO?
-   coreEnv->setMapKey("GITHUB_GRAPHQL_URL",ctx->getMapKey("graphql_url"));
-   coreEnv->setMapKey("GITHUB_HEAD_REF",ctx->getMapKey("head_ref"));
-   coreEnv->setMapKey("GITHUB_JOB",ctx->getMapKey("job"));
-   coreEnv->setMapKey("GITHUB_REF",ctx->getMapKey("ref"));
-   coreEnv->setMapKey("GITHUB_REF_NAME",ctx->getMapKey("ref_name"));
-   coreEnv->setMapKey("GITHUB_REF_PROTECTED",ctx->getMapKey("ref_protected"));
-   coreEnv->setMapKey("GITHUB_REF_TYPE",ctx->getMapKey("ref_type"));
-   coreEnv->setMapKey("GITHUB_REPOSITORY",ctx->getMapKey("repository"));
-   coreEnv->setMapKey("GITHUB_REPOSITORY_ID",ctx->getMapKey("event").getObject()->getMapKey("repository").getObject()->getMapKey("id"));
-   coreEnv->setMapKey("GITHUB_REPOSITORY_OWNER",ctx->getMapKey("repository_owner"));
-   coreEnv->setMapKey("GITHUB_REPOSITORY_OWNER_ID",ctx->getMapKey("repository_owner_id"));
+   coreEnv->setMapKey("GITHUB_GRAPHQL_URL",gitContext->getMapKey("graphql_url"));
+   coreEnv->setMapKey("GITHUB_HEAD_REF",gitContext->getMapKey("head_ref"));
+   coreEnv->setMapKey("GITHUB_JOB",gitContext->getMapKey("job"));
+   coreEnv->setMapKey("GITHUB_REF",gitContext->getMapKey("ref"));
+   coreEnv->setMapKey("GITHUB_REF_NAME",gitContext->getMapKey("ref_name"));
+   coreEnv->setMapKey("GITHUB_REF_PROTECTED",gitContext->getMapKey("ref_protected"));
+   coreEnv->setMapKey("GITHUB_REF_TYPE",gitContext->getMapKey("ref_type"));
+   coreEnv->setMapKey("GITHUB_REPOSITORY",gitContext->getMapKey("repository"));
+   coreEnv->setMapKey("GITHUB_REPOSITORY_ID",gitContext->getMapKey("event").getObject()->getMapKey("repository").getObject()->getMapKey("id"));
+   coreEnv->setMapKey("GITHUB_REPOSITORY_OWNER",gitContext->getMapKey("repository_owner"));
+   coreEnv->setMapKey("GITHUB_REPOSITORY_OWNER_ID",gitContext->getMapKey("repository_owner_id"));
    coreEnv->setMapKey("GITHUB_RETENTION_DAYS", ExprValue().setString(*exprState->mStringTable, "0")); // TODO
-   coreEnv->setMapKey("GITHUB_RUN_ATTEMPT",ctx->getMapKey("run_attempt"));
-   coreEnv->setMapKey("GITHUB_RUN_ID",ctx->getMapKey("run_id"));
-   coreEnv->setMapKey("GITHUB_RUN_NUMBER",ctx->getMapKey("run_number"));
-   coreEnv->setMapKey("GITHUB_SERVER_URL",ctx->getMapKey("server_url"));
-   coreEnv->setMapKey("GITHUB_SHA",ctx->getMapKey("sha"));
+   coreEnv->setMapKey("GITHUB_RUN_ATTEMPT",gitContext->getMapKey("run_attempt"));
+   coreEnv->setMapKey("GITHUB_RUN_ID",gitContext->getMapKey("run_id"));
+   coreEnv->setMapKey("GITHUB_RUN_NUMBER",gitContext->getMapKey("run_number"));
+   coreEnv->setMapKey("GITHUB_SERVER_URL",gitContext->getMapKey("server_url"));
+   coreEnv->setMapKey("GITHUB_SHA",gitContext->getMapKey("sha"));
    coreEnv->setMapKey("GITHUB_STEP_SUMMARY",ExprValue().setString(*exprState->mStringTable, "")); // TODO
-   coreEnv->setMapKey("GITHUB_TOKEN",ctx->getMapKey("token"));
-   coreEnv->setMapKey("GITHUB_TRIGGERING_ACTOR",ctx->getMapKey("triggering_actor"));
-   coreEnv->setMapKey("GITHUB_WORKFLOW",ctx->getMapKey("workflow"));
-   coreEnv->setMapKey("GITHUB_WORKSPACE",ctx->getMapKey("workspace"));
+   coreEnv->setMapKey("GITHUB_TOKEN",gitContext->getMapKey("token"));
+   coreEnv->setMapKey("GITHUB_TRIGGERING_ACTOR",gitContext->getMapKey("triggering_actor"));
+   coreEnv->setMapKey("GITHUB_WORKFLOW",gitContext->getMapKey("workflow"));
+   coreEnv->setMapKey("GITHUB_WORKSPACE",gitContext->getMapKey("workspace"));
    
-   
-   ExprObject* runnerCtx = exprState->getContext("runner");
+   // Setup runner env
+   runnerCtx = exprState->getContext("runner");
    coreEnv->setMapKey("RUNNER_ARCH", runnerCtx->getMapKey("arch"));
    coreEnv->setMapKey("RUNNER_DEBUG", runnerCtx->getMapKey("debug").coerceStringValue(*exprState->mStringTable));
    coreEnv->setMapKey("RUNNER_NAME", ExprValue().setString(*exprState->mStringTable, "unknown"));
@@ -1854,73 +1875,30 @@ void PerformTask(TaskTracker* currentTask)
    
    coreEnv->setMapKey("CI", ExprValue().setString(*exprState->mStringTable, "true"));
    
+   //coreEnv->setMapKey("GITHUB_ENV", ExprValue().setString(*exprState->mStringTable, gitContext->getMapKey("base_ref")));
+}
+
+void PerformTaskSteps(TaskTracker* currentTask, ExprState* exprState, StepState& stepState, std::string& jobName)
+{
+   char buffer[4096];
    
-   //coreEnv->setMapKey("GITHUB_ENV", ExprValue().setString(*exprState->mStringTable, ctx->getMapKey("base_ref")));
-   
-   std::vector<JobStepDefinition*> steps;
-   std::vector<JobStepContext*> stepContexts;
-   getTypedObjectsFromArray<JobStepDefinition>(jobDefinition->mSteps.asObject<ExprArray>(), steps);
-   
-   // Create live steps
-   stepContexts.reserve(steps.size());
-   for (JobStepDefinition* def : steps)
-   {
-      if (def->mId.getString() == NULL)
-      {
-         stepContexts.push_back(NULL);
-      }
-      else
-      {
-         JobStepContext* stepCtx = new JobStepContext(exprState);
-         stepContexts.push_back(stepCtx);
-         stepsList->setMapKey(def->mId.getString(), ExprValue().setObject(stepCtx));
-      }
-   }
-   
-   printf("Running job %s\n", jobName.c_str());
-   // Check if job has "if"
-   if (jobDefinition->mConditional.getString())
-   {
-      std::string conditional = jobDefinition->mConditional.getString();
-      ExprValue conditionalValue = exprState->substituteSingleExpression(conditional);
-      if (conditionalValue.getBool() == false)
-      {
-         // Skip job
-         for (int i=0; i<steps.size(); i++)
-         {
-            currentTask->beginStep(i);
-            currentTask->endStep(runner::v1::RESULT_SKIPPED);
-         }
-         currentTask->setResult(runner::v1::RESULT_SKIPPED);
-         currentTask->log("Job conditional test failed", true);
-         currentTask->_waitForLogSync();
-         //
-         currentTask->endJob();
-         currentTask->setFinished();
-         return;
-      }
-      else
-      {
-         currentTask->log("Job conditional test passed");
-      }
-   }
+   ExprMap* gitContext = (ExprMap*)exprState->getContext("github");
    
    // SETUP DONE
-   
-   snprintf(buffer, sizeof(buffer), "Performing %i tasks for job %s...", (int)steps.size(), jobName.c_str());
+   snprintf(buffer, sizeof(buffer), "Performing %i tasks for job %s...", (int)stepState.steps.size(), jobName.c_str());
    currentTask->log(buffer);
   
    //getTypedObjectsFromArray
    uint32_t stepCount = 0;
    runner::v1::Result jobResult = runner::v1::RESULT_SUCCESS;
    
-   for (size_t i=0; i<steps.size(); i++)
+   for (size_t i=0; i<stepState.steps.size(); i++)
    {
-      JobStepDefinition* step = steps[i];
-      JobStepContext* stepCtx = stepContexts[i];
+      JobStepDefinition* step = stepState.steps[i];
+      JobStepContext* stepCtx = stepState.stepContexts[i];
       
       // Update context for step
-      env->mSlots[REnv_Step] = step->mEnv.getObject();
+      stepState.env->mSlots[REnv_Step] = step->mEnv.getObject();
       exprState->setContext("inputs", gitContext->getMapKey("event").getObject()->getMapKey("inputs").getObject());
       
       currentTask->beginStep(stepCount);
@@ -1955,8 +1933,8 @@ void PerformTask(TaskTracker* currentTask)
       
       ExprMap* stepMap = stepCtx ? stepCtx->mOutputs.asObject<ExprMap>() : NULL;
       runner::v1::Result result = step->execute(currentTask,
-                                                env,
-                                                env->mSlots[REnv_Job],
+                                                stepState.env,
+                                                stepState.env->mSlots[REnv_Job],
                                                 stepMap);
       if (stepCtx)
       {
@@ -1978,14 +1956,13 @@ void PerformTask(TaskTracker* currentTask)
    }
    
    // Set outputs according to job description
-   ExprMap* outputList = jobDefinition->mOutputs.asObject<ExprMap>();
-   if (outputList)
+   if (stepState.outputMap)
    {
       std::vector<std::string> outputKeys;
-      outputList->extractKeys(outputKeys);
+      stepState.outputMap->extractKeys(outputKeys);
       for (std::string& key : outputKeys)
       {
-         ExprValue val = outputList->getMapKey(key);
+         ExprValue val = stepState.outputMap->getMapKey(key);
          if (val.isString())
          {
             std::string outputData = exprState->substituteExpressions(val.getString());
@@ -2001,6 +1978,62 @@ void PerformTask(TaskTracker* currentTask)
    //
    currentTask->endJob();
    currentTask->setFinished();
+}
+
+// Example thread to send dummy updates to the server
+void PerformTask(TaskTracker* currentTask)
+{
+   // SETUP
+   currentTask->beginJob();
+   
+   std::vector<std::string> jobList;
+   currentTask->_getWorkflow()->mJobs.getObject()->extractKeys(jobList);
+   
+   std::string jobName = jobList[0];
+   JobDefinition* jobDefinition = currentTask->_getWorkflow()->mJobs.asObject<ExprMap>()->getMapKey(jobName).asObject<JobDefinition>();
+   
+   ExprState* exprState = currentTask->_getExprState();
+   SetupExprState(currentTask, exprState);
+   
+   // Gen step contexts
+   StepState stepState;
+   stepState.stepsMap = (ExprMap*)exprState->getContext("steps");
+   stepState.env = (ExprMultiKey*)exprState->getContext("env");
+   stepState.outputMap = jobDefinition->mOutputs.asObject<ExprMap>();
+   GetStepStateSteps(exprState, jobDefinition->mSteps.asObject<ExprArray>(), stepState);
+   
+   // Make sure we have job env set...
+   stepState.env->mSlots[REnv_Job] = EvaluateAllKeys(jobDefinition->mEnv.getObject());
+   
+   printf("Running job %s\n", jobName.c_str());
+   // Check if job has "if"
+   if (jobDefinition->mConditional.getString())
+   {
+      std::string conditional = jobDefinition->mConditional.getString();
+      ExprValue conditionalValue = exprState->substituteSingleExpression(conditional);
+      if (conditionalValue.getBool() == false)
+      {
+         // Skip job
+         for (int i=0; i<stepState.steps.size(); i++)
+         {
+            currentTask->beginStep(i);
+            currentTask->endStep(runner::v1::RESULT_SKIPPED);
+         }
+         currentTask->setResult(runner::v1::RESULT_SKIPPED);
+         currentTask->log("Job conditional test failed", true);
+         currentTask->_waitForLogSync();
+         //
+         currentTask->endJob();
+         currentTask->setFinished();
+         return;
+      }
+      else
+      {
+         currentTask->log("Job conditional test passed");
+      }
+   }
+   
+   PerformTaskSteps(currentTask, exprState, stepState, jobName);
 }
 
 std::unordered_map<std::string, FuncInfo> ExprState::smFunctions;
