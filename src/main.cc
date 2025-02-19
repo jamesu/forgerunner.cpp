@@ -1094,6 +1094,75 @@ template<> void ExprFieldObject::registerFieldsForType<JobDefinition>()
    registerField<JobDefinition>("secrets", offsetof(JobDefinition, mSecrets), ExprValue::OBJECT, false);
 }
 
+struct JobStepContext;
+
+struct JobStepsState
+{
+   std::vector<JobStepDefinition*> steps;
+   std::vector<JobStepContext*> stepContexts;
+   ExprMap* stepsMap;
+   ExprMap* jobOutput;
+   ExprMultiKey* env;
+};
+
+struct SingleStepState
+{
+   JobStepDefinition* definition;
+   JobStepContext* context;
+   ExprMap* outputStep;
+   ExprMap* outputEnv;
+   ExprMultiKey* env;
+   int index;
+};
+
+class JobStepExecutor
+{
+public:
+   typedef std::function<JobStepExecutor*()> CreateFunc;
+   
+   struct StepResult
+   {
+      runner::v1::Result result;
+      bool doContinue;
+   };
+   
+   ExprState* mState;
+   TaskTracker* mTask;
+   SingleStepState mStepState;
+
+   JobStepExecutor() : mState(NULL), mTask(NULL)
+   {
+   }
+   virtual ~JobStepExecutor()
+   {
+   }
+   
+   virtual StepResult execute()
+   {
+      return {runner::v1::RESULT_FAILURE, false};
+   }
+   
+   template<class T> static T* createExecutor() { return new T(); }
+   
+    static void registerExecutor(const std::string& key, CreateFunc createFunc)
+    {
+        getRegistry()[key] = createFunc;
+    }
+
+    static CreateFunc getExecutor(const std::string& key)
+    {
+        auto& registry = getRegistry();
+        return registry.count(key) ? registry[key] : registry["default"];
+    }
+
+private:
+   
+    static std::unordered_map<std::string, CreateFunc>& getRegistry()
+    {
+        static std::unordered_map<std::string, CreateFunc> registry;
+        return registry;
+    }
+};
 
 struct JobStepDefinition : public BasicContext
 {
@@ -1108,32 +1177,6 @@ struct JobStepDefinition : public BasicContext
    }
    
    virtual ~JobStepDefinition() = default;
-   
-   virtual runner::v1::Result execute(TaskTracker* tracker, 
-                                      ExprMultiKey* env,
-                                      ExprObject* outEnv,
-                                      ExprObject* outputs)
-   {
-      std::string cmdToRun = mState->substituteExpressions(mRun.getStringSafe());
-      char buffer[4096];
-      snprintf(buffer, sizeof(buffer), "TODO: run %s", cmdToRun.c_str());
-      tracker->log(buffer);
-      
-      
-      UnixShellExecutor shellExec(mState);
-      shellExec.mJobID = std::to_string(tracker->_getTask().id());
-      shellExec.mLogHandler = [tracker](const char* data, size_t len) {
-         std::string sdata(data, len);
-         tracker->log(sdata.c_str());
-      };
-      
-      std::string cwd = mCwd.getString() ? mCwd.getString() : std::filesystem::current_path().c_str();
-      std::string shell = mShell.getString() ? mShell.getString() : "/bin/bash";
-      
-      shellExec.execute(cwd, shell, cmdToRun, env, outEnv, outputs);
-      
-      return runner::v1::RESULT_SUCCESS;
-   }
    
    std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<JobStepDefinition>(); }
 };
@@ -1414,6 +1457,7 @@ SingleWorkflowDefinition::SingleWorkflowDefinition(ExprState* state) : ExprField
    ExprMap* jobMap = new ExprMap(state);
    jobMap->mAddObjectFunc = ExprArray::addTypedObjectFunc<JobDefinition>;
    mJobs.setObject(jobMap);
+   //mSecrets.setObject(new ExprMap(state));
 }
 
 JobDefinition::JobDefinition(ExprState* state) : BasicContext(state)
@@ -1755,16 +1799,7 @@ ExprObject* EvaluateAllKeys(ExprObject* obj)
    return obj;
 }
 
-struct StepState
-{
-   std::vector<JobStepDefinition*> steps;
-   std::vector<JobStepContext*> stepContexts;
-   ExprMap* stepsMap;
-   ExprMap* outputMap;
-   ExprMultiKey* env;
-};
-
-void GetStepStateSteps(ExprState* exprState, ExprArray* stepList, StepState& state)
+void GetStepStateSteps(ExprState* exprState, ExprArray* stepList, JobStepsState& state)
 {
    getTypedObjectsFromArray<JobStepDefinition>(stepList, state.steps);
    
@@ -1939,6 +1974,58 @@ private:
     }
 };
 
+class StandardStepExecutor : public JobStepExecutor
+{
+public:
+   
+   StepResult execute() override
+   {
+      char buffer[512];
+      bool continueOnError = mStepState.definition->mContinueOnError.getBool();
+      
+      EvaluateAllKeys(dynamic_cast<ExprMap*>(mStepState.definition->mEnv.getObject())); // resolve keys for STEP
+      
+      snprintf(buffer, sizeof(buffer), "Doing something in step %i...", mStepState.index);
+      mTask->log(buffer);
+      
+      ExprMap* stepMap = mStepState.context ? mStepState.context->mOutputs.asObject<ExprMap>() : NULL;
+      runner::v1::Result result = internalExecute();
+      
+      if (mStepState.context)
+      {
+         mStepState.context->mOutcome.setString(*mState->mStringTable, RunnerResultToString(result));
+         mStepState.context->mConclusion.setString(*mState->mStringTable, RunnerResultToString(result));
+      }
+      
+      return { result, continueOnError };
+   }
+   
+   
+   runner::v1::Result internalExecute()
+   {
+      std::string cmdToRun = mState->substituteExpressions(mStepState.definition->mRun.getStringSafe());
+      char buffer[4096];
+      snprintf(buffer, sizeof(buffer), "TODO: run %s", cmdToRun.c_str());
+      mTask->log(buffer);
+      
+      TaskTracker* task = mTask;
+      UnixShellExecutor shellExec(mState);
+      shellExec.mJobID = std::to_string(mTask->_getTask().id());
+      shellExec.mLogHandler = [task](const char* data, size_t len) {
+         std::string sdata(data, len);
+         task->log(sdata.c_str());
+      };
+      
+      std::string cwd = mStepState.definition->mCwd.getString() ? mStepState.definition->mCwd.getString() : std::filesystem::current_path().c_str();
+      std::string shell = mStepState.definition->mShell.getString() ? mStepState.definition->mShell.getString() : "/bin/bash";
+      
+      shellExec.execute(cwd, shell, cmdToRun, mStepState.env, mStepState.outputEnv, mStepState.outputStep);
+      
+      return runner::v1::RESULT_SUCCESS;
+   }
+   
+};
+
 class StandardJobExecutor : public JobExecutor
 {
 public:
@@ -1947,10 +2034,10 @@ public:
       SetupExprState(mTask, mState);
       
       // Gen step contexts
-      StepState stepState;
+      JobStepsState stepState;
       stepState.stepsMap = (ExprMap*)mState->getContext("steps");
       stepState.env = (ExprMultiKey*)mState->getContext("env");
-      stepState.outputMap = mJob->mOutputs.asObject<ExprMap>();
+      stepState.jobOutput = mJob->mOutputs.asObject<ExprMap>();
       GetStepStateSteps(mState, mJob->mSteps.asObject<ExprArray>(), stepState);
       
       mCurrentStep = 0;
@@ -1979,7 +2066,7 @@ public:
       performTaskSteps(stepState);
    }
    
-   void performTaskSteps(StepState& stepState)
+   void performTaskSteps(JobStepsState& stepState)
    {
       char buffer[4096];
       
@@ -2027,43 +2114,63 @@ public:
             }
          }
          
-         EvaluateAllKeys(dynamic_cast<ExprMap*>(step->mEnv.getObject())); // resolve keys for STEP
+         // Find executor
          
-         snprintf(buffer, sizeof(buffer), "Doing something in step %u...", stepCount);
-         mTask->log(buffer);
-         
-         ExprMap* stepMap = stepCtx ? stepCtx->mOutputs.asObject<ExprMap>() : NULL;
-         runner::v1::Result result = step->execute(mTask,
-                                                   stepState.env,
-                                                   stepState.env->mSlots[REnv_Job],
-                                                   stepMap);
-         if (stepCtx)
+         const char* stepUses = step->mUses.getString();
+         if (stepUses == NULL)
          {
-            stepCtx->mOutcome.setString(*mState->mStringTable, RunnerResultToString(result));
-            stepCtx->mConclusion.setString(*mState->mStringTable, RunnerResultToString(result));
+            stepUses = "default";
          }
          
-         if (!(result == runner::v1::RESULT_SUCCESS || result == runner::v1::RESULT_SKIPPED) &&
+         JobStepExecutor::StepResult stepResult = {runner::v1::RESULT_FAILURE, false};
+         JobStepExecutor::CreateFunc executorFunc = JobStepExecutor::getExecutor(stepUses);
+         if (executorFunc == NULL)
+         {
+            std::string err = std::string("Error: couldn't find executor: ") + stepUses;
+            mTask->log(err.c_str());
+         }
+         else
+         {
+            JobStepExecutor* executor = executorFunc();
+            
+            SingleStepState singleState;
+            singleState.definition = step;
+            singleState.context = stepCtx;
+            singleState.outputStep = stepCtx ? stepCtx->mOutputs.asObject<ExprMap>() : NULL;
+            singleState.outputEnv = (ExprMap*)stepState.env->mSlots[REnv_Job];
+            singleState.env = stepState.env;
+            singleState.index = i;
+            
+            executor->mState = mState;
+            executor->mTask = mTask;
+            executor->mStepState = singleState;
+            
+            stepResult = executor->execute();
+            delete executor;
+         }
+         
+         
+         if (!(stepResult.result == runner::v1::RESULT_SUCCESS || stepResult.result == runner::v1::RESULT_SKIPPED) &&
              !step->mContinueOnError.getBool())
          {
-            jobResult = result;
-            mTask->endStep(result);
+            jobResult = stepResult.result;
+            mTask->endStep(jobResult);
             break;
          }
          
          sleep(1);
-         mTask->endStep(result);
+         mTask->endStep(stepResult.result);
          stepCount++;
       }
       
-      // Set outputs according to job description
-      if (stepState.outputMap)
+      // Set all job outputs according to job description
+      if (stepState.jobOutput)
       {
          std::vector<std::string> outputKeys;
-         stepState.outputMap->extractKeys(outputKeys);
+         stepState.jobOutput->extractKeys(outputKeys);
          for (std::string& key : outputKeys)
          {
-            ExprValue val = stepState.outputMap->getMapKey(key);
+            ExprValue val = stepState.jobOutput->getMapKey(key);
             if (val.isString())
             {
                std::string outputData = mState->substituteExpressions(val.getString());
@@ -2143,6 +2250,7 @@ int main(int argc, char** argv)
    ExprFieldObject::registerFieldsForType<RunnerInfo>();
    
    JobExecutor::registerExecutor("default", JobExecutor::createExecutor<StandardJobExecutor>);
+   JobStepExecutor::registerExecutor("default", JobStepExecutor::createExecutor<StandardStepExecutor>);
    
    RunnerState state;
    state.tasks_version = 0;
