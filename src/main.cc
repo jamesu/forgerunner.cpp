@@ -243,19 +243,94 @@ struct SingleWorkflowDefinition;
 #endif
 
 std::unordered_map<std::string, std::string> ParseEnvFile(const std::string &filename);
+std::vector<std::string> ParsePathFile(const std::string &filename);
 
-struct ShellExecutor
+struct LaunchEnv
 {
-   ExprState* mState;
-   RunnerState* mRunnerState;
-   std::string mJobID;
-   std::function<void(const char*, std::size_t)> mLogHandler;
+   std::string mJobPrefix; // std::to_string(GET_PID()) + "-run-" + mJobID
+   std::vector<std::string> mTempLaunchCmd;
+   std::vector<std::string> mTempLaunchEnv;
    
-   ShellExecutor(ExprState* state) : mState(state), mRunnerState(NULL)
+   LaunchEnv()
    {
    }
    
-   static void dumpEnv(ExprObject* map, std::vector<std::string>& values, std::vector<const char*>& valuesChar)
+   virtual ~LaunchEnv()
+   {
+   }
+   
+   virtual std::string getLocalPrefix()
+   {
+      return "";
+   }
+   virtual std::string getRemotePrefix()
+   {
+      return "";
+   }
+   virtual void writeScript(const std::string& cwd, const std::string& cmdList)
+   {
+   }
+   virtual std::string getScriptPath(const std::string& prefix)
+   {
+      return "";
+   }
+   virtual void getOutputPaths(const std::string& prefix, std::string& envPath, std::string& outputPath, std::string& pathPath)
+   {
+   }
+   virtual void getLaunchCommand(const std::string& shell, std::vector<std::string>& launchCmds, std::vector<std::string>& launchEnv)
+   {
+   }
+   virtual void prepareEnv(ExprObject* env)
+   {
+   }
+   
+   virtual void cleanup()
+   {
+      std::vector<std::string> outPaths;
+      outPaths.resize(3);
+      getOutputPaths(getLocalPrefix(), outPaths[0], outPaths[1], outPaths[2]);
+      outPaths.push_back(getScriptPath(getLocalPrefix()));
+      for (const std::string& path : outPaths)
+      {
+         if (std::filesystem::exists(path))
+         {
+            std::filesystem::remove(path);
+         }
+      }
+   }
+   
+   static void dumpEnvToFile(ExprObject* map, std::string filename)
+   {
+      std::vector<std::string> values;
+      map->extractKeys(values);
+      std::ofstream outFile(filename, std::ios::binary);
+      for (size_t i=0; i<values.size(); i++)
+      {
+         ExprValue value = map->getMapKey(values[i]);
+         if (value.isBool())
+         {
+            outFile << values[i];
+            outFile << "=";
+            outFile << (value.getBool() ? "true" : "false");
+         }
+         else if (value.isString())
+         {
+            outFile << values[i];
+            outFile << "=";
+            outFile << value.getString();
+         }
+         else
+         {
+            outFile << values[i];
+            outFile << "=";
+            outFile << std::to_string(value.getNumber());
+         }
+         outFile << std::endl;
+      }
+      outFile.close();
+   }
+   
+   static void dumpEnv(ExprObject* map, std::vector<std::string>& values)
    {
       map->extractKeys(values);
       for (size_t i=0; i<values.size(); i++)
@@ -273,78 +348,29 @@ struct ShellExecutor
          {
             values[i] = values[i] + std::string("=") + std::to_string(value.getNumber());
          }
-         valuesChar.push_back(values[i].c_str());
       }
-   }
-   
-   virtual runner::v1::Result execute(const std::string& cwd,
-                                      const std::string& shell,
-                                      const std::string& cmdList,
-                                      ExprMultiKey* env,
-                                      ExprObject* outEnv,
-                                      ExprObject* outputs) = 0;
-   
-   virtual ~ShellExecutor()
-   {
    }
 };
 
-struct UnixShellExecutor : public ShellExecutor
+struct ShellExecutor
 {
-   struct subprocess_s mSubprocess;
+   ExprState* mState;
+   RunnerState* mRunnerState;
+   std::string mJobID;
+   std::function<void(const char*, std::size_t)> mLogHandler;
    
-   UnixShellExecutor(ExprState* state) : ShellExecutor(state)
+   struct subprocess_s mSubprocess;
+   std::string mTempPrefix;
+   std::vector<std::string> mEnvS;
+   std::vector<const char*> mEnvC;
+   LaunchEnv* mLaunchEnv;
+   
+   ShellExecutor(ExprState* state, LaunchEnv* launchEnv) : mState(state), mRunnerState(NULL), mLaunchEnv(launchEnv)
    {
    }
    
-   runner::v1::Result execute(const std::string& cwd,
-                              const std::string& shell,
-                              const std::string& cmdList,
-                              ExprMultiKey* env,
-                              ExprObject* outEnv,
-                              ExprObject* outputs) override
+   void pollLogs()
    {
-      // Define the file name
-      std::filesystem::path filePath = std::filesystem::temp_directory_path() / (std::to_string(GET_PID()) + "-run-" + mJobID + ".sh");
-      std::filesystem::path outputPath = std::filesystem::temp_directory_path() / (std::to_string(GET_PID()) + "-run-" + mJobID + "-outputs.env");
-      std::filesystem::path envPath = std::filesystem::temp_directory_path() / (std::to_string(GET_PID()) + "-run-" + mJobID + "-env.env");
-      
-      // Update step env
-      env->mSlots[REnv_Step]->setMapKey("GITHUB_ENV", ExprValue().setString(*mState->mStringTable, envPath.c_str()));
-      env->mSlots[REnv_Step]->setMapKey("GITHUB_OUTPUT", ExprValue().setString(*mState->mStringTable, outputPath.c_str()));
-      env->mSlots[REnv_Step]->setMapKey("GITHUB_PATH", ExprValue().setString(*mState->mStringTable, "")); // TODO
-      
-      // Load env
-      
-      std::vector<std::string> envS;
-      std::vector<const char*> envC;
-      
-      if (env != NULL)
-      {
-         dumpEnv(env, envS, envC);
-      }
-      
-      envC.push_back(NULL);
-      
-      // Write temp script
-      
-      std::ofstream outFile(filePath, std::ios::binary);
-      outFile << "set -e\n";
-      outFile << "cd \"" + cwd + "\"\n";
-      outFile << cmdList;
-      outFile << "\n";
-      outFile.close();
-      std::filesystem::remove(outputPath);
-      std::filesystem::remove(envPath);
-      
-      const char *command_line[] = {shell.c_str(), filePath.c_str(), NULL};
-      int result = subprocess_create_ex(command_line,
-                                        subprocess_option_enable_async |
-                                        subprocess_option_combined_stdout_stderr,
-                                        &envC[0], &mSubprocess);
-      
-      // Poll logs
-      
       char buffer[4096];
       char* curLine = buffer;
       buffer[0] = '\0';
@@ -413,13 +439,15 @@ struct UnixShellExecutor : public ShellExecutor
               curLine = buffer; // Reset buffer
           }
       }
+   }
+   
+   void processOutput(ExprObject* outEnv, ExprObject* outputs, ExprObject* outPaths)
+   {
+      std::string envPath;
+      std::string outputPath;
+      std::string pathPath;
       
-      int process_return = 0;
-      subprocess_join(&mSubprocess, &process_return);
-      //subprocess_terminate(&mSubprocess);
-      
-      // Cleanup
-      std::filesystem::remove(filePath);
+      mLaunchEnv->getOutputPaths(mLaunchEnv->getLocalPrefix(), envPath, outputPath, pathPath);
       
       if (std::filesystem::exists(envPath))
       {
@@ -432,8 +460,8 @@ struct UnixShellExecutor : public ShellExecutor
                outEnv->setMapKey(itr.first, ExprValue().setString(*mState->mStringTable, itr.second.c_str()));
             }
          }
-         std::filesystem::remove(envPath);
       }
+      
       if (std::filesystem::exists(outputPath))
       {
          if (outputs)
@@ -444,14 +472,205 @@ struct UnixShellExecutor : public ShellExecutor
             {
                outputs->setMapKey(itr.first, ExprValue().setString(*mState->mStringTable, itr.second.c_str()));
             }
-            std::filesystem::remove(outputPath);
          }
       }
+      
+      if (std::filesystem::exists(pathPath))
+      {
+         if (outPaths)
+         {
+            // Load output
+            auto vec = ParsePathFile(outputPath);
+            for (auto& itr : vec)
+            {
+               outPaths->addArrayValue(ExprValue().setString(*mState->mStringTable, itr.c_str()));
+            }
+         }
+      }
+   }
+   
+   runner::v1::Result execute(const std::string& cwd,
+                              const std::string& shell,
+                              const std::string& cmdList,
+                              ExprMultiKey* env,
+                              ExprObject* outEnv,
+                              ExprObject* outputs,
+                              ExprObject* outPaths)
+   {
+      // Define the file name
+      mLaunchEnv->mJobPrefix = (std::to_string(GET_PID()) + "-run-" + mJobID);
+      mLaunchEnv->cleanup();
+      
+      // Update step env
+      {
+         std::string localPrefix = mLaunchEnv->getLocalPrefix();
+         std::string envPath;
+         std::string outputPath;
+         std::string pathPath;
+         mLaunchEnv->getOutputPaths(mLaunchEnv->getLocalPrefix(), envPath, outputPath, pathPath);
+         
+         env->mSlots[REnv_Step]->setMapKey("GITHUB_ENV", ExprValue().setString(*mState->mStringTable, envPath.c_str()));
+         env->mSlots[REnv_Step]->setMapKey("GITHUB_OUTPUT", ExprValue().setString(*mState->mStringTable, outputPath.c_str()));
+         env->mSlots[REnv_Step]->setMapKey("GITHUB_PATH", ExprValue().setString(*mState->mStringTable, pathPath.c_str()));
+      }
+      // Load env
+      
+      mLaunchEnv->prepareEnv(env);
+      
+      std::vector<std::string> launchCmdsS;
+      std::vector<const char*> launchCmdsC;
+      std::vector<std::string> envS;
+      std::vector<const char*> envC;
+      
+      // Write temp script
+      
+      mLaunchEnv->writeScript(cwd, cmdList);
+      mLaunchEnv->getLaunchCommand(shell, launchCmdsS, envS);
+      
+      for (const std::string& str : launchCmdsS)
+      {
+         launchCmdsC.push_back(str.c_str());
+      }
+      launchCmdsC.push_back(NULL);
+      for (const std::string& str : envS)
+      {
+         envC.push_back(str.c_str());
+      }
+      envC.push_back(NULL);
+      
+      int result = subprocess_create_ex(&launchCmdsC[0],
+                                        subprocess_option_enable_async |
+                                        subprocess_option_combined_stdout_stderr,
+                                        &envC[0], &mSubprocess);
+      
+      pollLogs();
+      
+      int process_return = 0;
+      subprocess_join(&mSubprocess, &process_return);
+      
+      //
+      
+      processOutput(outEnv, outputs, outPaths);
+      mLaunchEnv->cleanup();
       
       return process_return != 0 ?  runner::v1::RESULT_FAILURE : runner::v1::RESULT_SUCCESS;
    }
 };
 
+struct SHLaunchEnv : public LaunchEnv
+{
+   std::string getLocalPrefix() override
+   {
+      return std::filesystem::temp_directory_path();
+   }
+   
+   std::string getRemotePrefix() override
+   {
+      return std::filesystem::temp_directory_path();
+   }
+   
+   void prepareEnv(ExprObject* env) override
+   {
+      dumpEnv(env, mTempLaunchEnv);
+   }
+   
+   void writeScript(const std::string& cwd, const std::string& cmdList) override
+   {
+      std::ofstream outFile(getScriptPath(getLocalPrefix()), std::ios::binary);
+      outFile << "set -e\n";
+      outFile << "cd \"" + cwd + "\"\n";
+      outFile << cmdList;
+      outFile << "\n";
+      outFile.close();
+   }
+   
+   std::string getScriptPath(const std::string& prefix) override
+   {
+      return std::filesystem::path(prefix) / (mJobPrefix + ".sh");
+   }
+   
+   void getOutputPaths(const std::string& prefix, std::string& envPath, std::string& outputPath, std::string& pathPath) override
+   {
+      envPath = (std::filesystem::path(prefix) / (mJobPrefix + ".env")).string();
+      outputPath = (std::filesystem::path(prefix) / (mJobPrefix + ".out")).string();
+      pathPath = (std::filesystem::path(prefix) / (mJobPrefix + ".path")).string();
+   }
+   
+   void getLaunchCommand(const std::string& shell, std::vector<std::string>& launchCmds, std::vector<std::string>& launchEnv) override
+   {
+      launchCmds.clear();
+      launchCmds.push_back(shell);
+      launchCmds.push_back(getScriptPath(getLocalPrefix()));
+      launchEnv = mTempLaunchEnv;
+   }
+};
+
+struct PSHLaunchEnv : public LaunchEnv
+{
+   std::string getLocalPrefix() override
+   {
+      return std::filesystem::temp_directory_path();
+   }
+   
+   std::string getRemotePrefix() override
+   {
+      return std::filesystem::temp_directory_path();
+   }
+   
+   void prepareEnv(ExprObject* env) override
+   {
+      dumpEnv(env, mTempLaunchEnv);
+   }
+   
+   void writeScript(const std::string& cwd, const std::string& cmdList) override
+   {
+      std::ofstream outFile(getScriptPath(getLocalPrefix()), std::ios::binary);
+      outFile << "$ErrorActionPreference = \"Stop\"\n";
+      outFile << "cd \"" + cwd + "\"\n";
+      outFile << cmdList;
+      outFile << "\n";
+      outFile.close();
+   }
+   
+   std::string getScriptPath(const std::string& prefix) override
+   {
+      return std::filesystem::path(prefix) / (mJobPrefix + ".ps1");
+   }
+   
+   void getOutputPaths(const std::string& prefix, std::string& envPath, std::string& outputPath, std::string& pathPath) override
+   {
+      envPath = (std::filesystem::path(prefix) / (mJobPrefix + ".env")).string();
+      outputPath = (std::filesystem::path(prefix) / (mJobPrefix + ".out")).string();
+      pathPath = (std::filesystem::path(prefix) / (mJobPrefix + ".path")).string();
+   }
+   
+   void getLaunchCommand(const std::string& shell, std::vector<std::string>& launchCmds, std::vector<std::string>& launchEnv) override
+   {
+      launchCmds.clear();
+      launchCmds.push_back(shell);
+      launchCmds.push_back(getScriptPath(getLocalPrefix()));
+      launchEnv = mTempLaunchEnv;
+   }
+};
+
+struct PodmanConfig
+{
+   int argc;
+   char** argv;
+   int envc;
+   char** env;
+   const char* regLogin;
+   const char* regPassword;
+   int portc;
+   char** portv;
+   int volc;
+   const char** volv;
+   const char* extra;
+   const char* network;
+   const char* image;
+   const char* entrypoint;
+   bool service;
+};
 
 // Thread safe util class to handle updating a task.
 // Note that changes are effectively batched until HealthCheck dispatches API calls.
@@ -1111,6 +1330,7 @@ struct SingleStepState
    JobStepContext* context;
    ExprMap* outputStep;
    ExprMap* outputEnv;
+   ExprMap* outputPath;
    ExprMultiKey* env;
    int index;
 };
@@ -1359,6 +1579,34 @@ std::string Trim(const std::string &str)
     if (first == std::string::npos) return "";
     size_t last = str.find_last_not_of(" \t\n\r");
     return str.substr(first, last - first + 1);
+}
+
+std::vector<std::string> ParsePathFile(const std::string &filename)
+{
+    std::ifstream file(filename);
+    std::vector<std::string> outputVars;
+    std::string line, key, value;
+    std::string delimiter = "";
+    
+    if (!file)
+    {
+       printf("Error: Could not open file %s\n", filename.c_str());
+       return {};
+    }
+
+    while (getline(file, line))
+    {
+        line = Trim(line);
+
+        if (line.empty())
+        {
+           continue;
+        }
+       outputVars.push_back(line);
+    }
+
+    file.close();
+    return outputVars;
 }
 
 std::unordered_map<std::string, std::string> ParseEnvFile(const std::string &filename)
@@ -2008,8 +2256,19 @@ public:
       snprintf(buffer, sizeof(buffer), "TODO: run %s", cmdToRun.c_str());
       mTask->log(buffer);
       
+      bool isPowerShell = strcmp(mStepState.definition->mShell.getStringSafe(), "powershell.exe") == 0;
+      
+      SHLaunchEnv shEnv;
+      PSHLaunchEnv psEnv;
+      LaunchEnv* theEnv = &shEnv;
+      
+      if (isPowerShell)
+      {
+         theEnv = &psEnv;
+      }
+      
       TaskTracker* task = mTask;
-      UnixShellExecutor shellExec(mState);
+      ShellExecutor shellExec(mState, theEnv);
       shellExec.mJobID = std::to_string(mTask->_getTask().id());
       shellExec.mLogHandler = [task](const char* data, size_t len) {
          std::string sdata(data, len);
@@ -2019,7 +2278,7 @@ public:
       std::string cwd = mStepState.definition->mCwd.getString() ? mStepState.definition->mCwd.getString() : std::filesystem::current_path().c_str();
       std::string shell = mStepState.definition->mShell.getString() ? mStepState.definition->mShell.getString() : "/bin/bash";
       
-      shellExec.execute(cwd, shell, cmdToRun, mStepState.env, mStepState.outputEnv, mStepState.outputStep);
+      shellExec.execute(cwd, shell, cmdToRun, mStepState.env, mStepState.outputEnv, mStepState.outputStep, mStepState.outputPath);
       
       return runner::v1::RESULT_SUCCESS;
    }
@@ -2139,6 +2398,7 @@ public:
             singleState.outputStep = stepCtx ? stepCtx->mOutputs.asObject<ExprMap>() : NULL;
             singleState.outputEnv = (ExprMap*)stepState.env->mSlots[REnv_Job];
             singleState.env = stepState.env;
+            singleState.outputPath = NULL; // TODO
             singleState.index = i;
             
             executor->mState = mState;
