@@ -245,18 +245,26 @@ struct SingleWorkflowDefinition;
 std::unordered_map<std::string, std::string> ParseEnvFile(const std::string &filename);
 std::vector<std::string> ParsePathFile(const std::string &filename);
 
+class ServiceManager;
+
 struct LaunchEnv
 {
+   ServiceManager* mService;
    std::string mJobPrefix; // std::to_string(GET_PID()) + "-run-" + mJobID
    std::vector<std::string> mTempLaunchCmd;
    std::vector<std::string> mTempLaunchEnv;
    
-   LaunchEnv()
+   LaunchEnv() : mService(NULL)
    {
    }
    
    virtual ~LaunchEnv()
    {
+   }
+   
+   virtual std::string getDefaultShell()
+   {
+      return "/bin/sh";
    }
    
    virtual std::string getLocalPrefix()
@@ -277,8 +285,9 @@ struct LaunchEnv
    virtual void getOutputPaths(const std::string& prefix, std::string& envPath, std::string& outputPath, std::string& pathPath)
    {
    }
-   virtual void getLaunchCommand(const std::string& shell, std::vector<std::string>& launchCmds, std::vector<std::string>& launchEnv)
+   virtual bool getLaunchCommand(const std::string& shell, std::vector<std::string>& launchCmds, std::vector<std::string>& launchEnv)
    {
+      return false;
    }
    virtual void prepareEnv(ExprObject* env)
    {
@@ -299,7 +308,7 @@ struct LaunchEnv
       }
    }
    
-   static void dumpEnvToFile(ExprObject* map, std::string filename)
+   static void dumpEnvToFile(ExprObject* map, const std::string& filename)
    {
       std::vector<std::string> values;
       map->extractKeys(values);
@@ -352,12 +361,89 @@ struct LaunchEnv
    }
 };
 
-struct ShellExecutor
+struct ServicesContext : public ExprFieldObject
 {
+   ExprValue mId;
+   ExprValue mCredentials;
+   ExprValue mEnv;
+   ExprValue mNetwork;
+   ExprValue mPorts;
+   
+   ServicesContext(ExprState* state) : ExprFieldObject(state)
+   {
+   }
+   
+   std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<ServicesContext>(); }
+};
+
+
+template<> void ExprFieldObject::registerFieldsForType<ServicesContext>()
+{
+   registerField<ServicesContext>("id", offsetof(ServicesContext, mId), ExprValue::STRING);
+   registerField<ServicesContext>("credentials", offsetof(ServicesContext, mCredentials), ExprValue::OBJECT);
+   registerField<ServicesContext>("env", offsetof(ServicesContext, mEnv), ExprValue::OBJECT);
+   registerField<ServicesContext>("network", offsetof(ServicesContext, mNetwork), ExprValue::OBJECT);
+   registerField<ServicesContext>("ports", offsetof(ServicesContext, mPorts), ExprValue::OBJECT);
+}
+
+
+class ServiceManager
+{
+public:
+   struct Config
+   {
+      ExprValue credentials;
+      ExprValue portList;
+      ExprValue volumeList;
+      ExprValue extra;
+      ExprValue network;
+      ExprValue image;
+      ExprValue entrypoint;
+      ExprValue env;
+      std::string name;
+   };
+   
+protected:
+   std::string mJobID;     // id of job
+   std::string mJobPrefix; // prefix of temp files for job
+   std::string mServiceID; // id of container
+   ExprState* mState;
+   std::mutex mMutex;
+   
+public:
+   
+   ServiceManager(ExprState* state);
+   
+   static std::string getWaitScript(const std::string& ident);
+   
+   static std::string getStopScript(const std::string& ident);
+   
+   static std::string getLaunchScript(Config& cfg);
+   
+   // starts service, storing id in context info
+   runner::v1::Result start(Config& cfg, ServicesContext* ctx);
+   
+   bool waitReady(int timeout, ServicesContext* ctx);
+   
+   // Stops service
+   bool stop();
+   
+   std::string getLocalPrefix();
+   
+   std::string getRemotePrefix();
+   
+   bool getExecCommands(std::vector<std::string>& cmds, const std::string& envFile);
+   
+   void cleanup();
+};
+
+class ShellExecutor
+{
+   typedef std::function<void(const char*, std::size_t)> LogHandlerFunc;
    ExprState* mState;
    RunnerState* mRunnerState;
    std::string mJobID;
-   std::function<void(const char*, std::size_t)> mLogHandler;
+   LogHandlerFunc mLogHandler;
    
    struct subprocess_s mSubprocess;
    std::string mTempPrefix;
@@ -365,8 +451,20 @@ struct ShellExecutor
    std::vector<const char*> mEnvC;
    LaunchEnv* mLaunchEnv;
    
+public:
+   
    ShellExecutor(ExprState* state, LaunchEnv* launchEnv) : mState(state), mRunnerState(NULL), mLaunchEnv(launchEnv)
    {
+   }
+   
+   void setJobID(const std::string& jobID)
+   {
+      mJobID = jobID;
+   }
+   
+   void setLogHandler(const LogHandlerFunc& func)
+   {
+      mLogHandler = func;
    }
    
    void pollLogs()
@@ -503,11 +601,10 @@ struct ShellExecutor
       
       // Update step env
       {
-         std::string localPrefix = mLaunchEnv->getLocalPrefix();
          std::string envPath;
          std::string outputPath;
          std::string pathPath;
-         mLaunchEnv->getOutputPaths(mLaunchEnv->getLocalPrefix(), envPath, outputPath, pathPath);
+         mLaunchEnv->getOutputPaths(mLaunchEnv->getRemotePrefix(), envPath, outputPath, pathPath);
          
          env->mSlots[REnv_Step]->setMapKey("GITHUB_ENV", ExprValue().setString(*mState->mStringTable, envPath.c_str()));
          env->mSlots[REnv_Step]->setMapKey("GITHUB_OUTPUT", ExprValue().setString(*mState->mStringTable, outputPath.c_str()));
@@ -525,7 +622,10 @@ struct ShellExecutor
       // Write temp script
       
       mLaunchEnv->writeScript(cwd, cmdList);
-      mLaunchEnv->getLaunchCommand(shell, launchCmdsS, envS);
+      if (!mLaunchEnv->getLaunchCommand(shell, launchCmdsS, envS))
+      {
+         throw std::runtime_error("Couldn't launch shell");
+      }
       
       for (const std::string& str : launchCmdsS)
       {
@@ -555,23 +655,44 @@ struct ShellExecutor
       
       return process_return != 0 ?  runner::v1::RESULT_FAILURE : runner::v1::RESULT_SUCCESS;
    }
+   
+   void terminate()
+   {
+      if (subprocess_alive(&mSubprocess))
+      {
+         subprocess_terminate(&mSubprocess);
+      }
+   }
 };
 
-struct SHLaunchEnv : public LaunchEnv
+class SHLaunchEnv : public LaunchEnv
 {
+public:
+   std::string getDefaultShell() override
+   {
+      return "/bin/bash";
+   }
+   
    std::string getLocalPrefix() override
    {
-      return std::filesystem::temp_directory_path();
+      return mService ? mService->getLocalPrefix() : std::filesystem::temp_directory_path().string();
    }
    
    std::string getRemotePrefix() override
    {
-      return std::filesystem::temp_directory_path();
+      return mService ? mService->getRemotePrefix() : std::filesystem::temp_directory_path().string();
    }
    
    void prepareEnv(ExprObject* env) override
    {
-      dumpEnv(env, mTempLaunchEnv);
+      if (mService)
+      {
+         dumpEnvToFile(env, (std::filesystem::path(getLocalPrefix()) / (mJobPrefix + ".env")));
+      }
+      else
+      {
+         dumpEnv(env, mTempLaunchEnv);
+      }
    }
    
    void writeScript(const std::string& cwd, const std::string& cmdList) override
@@ -596,30 +717,51 @@ struct SHLaunchEnv : public LaunchEnv
       pathPath = (std::filesystem::path(prefix) / (mJobPrefix + ".path")).string();
    }
    
-   void getLaunchCommand(const std::string& shell, std::vector<std::string>& launchCmds, std::vector<std::string>& launchEnv) override
+   bool getLaunchCommand(const std::string& shell, std::vector<std::string>& launchCmds, std::vector<std::string>& launchEnv) override
    {
       launchCmds.clear();
+      if (mService)
+      {
+         if (!mService->getExecCommands(launchCmds, (std::filesystem::path(getLocalPrefix()) / (mJobPrefix + ".env")).string()))
+         {
+            return false;
+         }
+      }
       launchCmds.push_back(shell);
-      launchCmds.push_back(getScriptPath(getLocalPrefix()));
+      launchCmds.push_back(getScriptPath(getRemotePrefix()));
       launchEnv = mTempLaunchEnv;
+      return true;
    }
 };
 
-struct PSHLaunchEnv : public LaunchEnv
+class PSHLaunchEnv : public LaunchEnv
 {
+public:
+   std::string getDefaultShell() override
+   {
+      return "powershell.exe";
+   }
+   
    std::string getLocalPrefix() override
    {
-      return std::filesystem::temp_directory_path();
+      return mService ? mService->getLocalPrefix() : std::filesystem::temp_directory_path().string();
    }
    
    std::string getRemotePrefix() override
    {
-      return std::filesystem::temp_directory_path();
+      return mService ? mService->getRemotePrefix() : std::filesystem::temp_directory_path().string();
    }
    
    void prepareEnv(ExprObject* env) override
    {
-      dumpEnv(env, mTempLaunchEnv);
+      if (mService)
+      {
+         dumpEnvToFile(env, (std::filesystem::path(getLocalPrefix()) / (mJobPrefix + ".env")));
+      }
+      else
+      {
+         dumpEnv(env, mTempLaunchEnv);
+      }
    }
    
    void writeScript(const std::string& cwd, const std::string& cmdList) override
@@ -644,33 +786,253 @@ struct PSHLaunchEnv : public LaunchEnv
       pathPath = (std::filesystem::path(prefix) / (mJobPrefix + ".path")).string();
    }
    
-   void getLaunchCommand(const std::string& shell, std::vector<std::string>& launchCmds, std::vector<std::string>& launchEnv) override
+   bool getLaunchCommand(const std::string& shell, std::vector<std::string>& launchCmds, std::vector<std::string>& launchEnv) override
    {
       launchCmds.clear();
+      if (mService)
+      {
+         if (!mService->getExecCommands(launchCmds, (std::filesystem::path(getLocalPrefix()) / (mJobPrefix + ".env")).string()))
+         {
+            return false;
+         }
+      }
       launchCmds.push_back(shell);
-      launchCmds.push_back(getScriptPath(getLocalPrefix()));
+      launchCmds.push_back(getScriptPath(getRemotePrefix()));
       launchEnv = mTempLaunchEnv;
+      return true;
    }
 };
 
-struct PodmanConfig
+std::string Trim(const std::string &str);
+   
+ServiceManager::ServiceManager(ExprState* state) : mState(state)
 {
-   int argc;
-   char** argv;
-   int envc;
-   char** env;
-   const char* regLogin;
-   const char* regPassword;
-   int portc;
-   char** portv;
-   int volc;
-   const char** volv;
-   const char* extra;
-   const char* network;
-   const char* image;
-   const char* entrypoint;
-   bool service;
-};
+}
+
+std::string ServiceManager::getWaitScript(const std::string& ident)
+{
+   std::ostringstream script;
+   script << "set -e\n\n";
+   script << "podman wait --condition healthy " << ident << std::endl;
+   return script.str();
+}
+
+std::string ServiceManager::getStopScript(const std::string& ident)
+{
+   std::ostringstream script;
+   script << "podman stop " << ident << std::endl;
+   script << "podman rm " << ident << std::endl;
+   return script.str();
+}
+
+std::string ServiceManager::getLaunchScript(Config& cfg)
+{
+   std::ostringstream script;
+   std::vector<ExprValue> tmpItems;
+   script << "set -e\n\n";
+   
+   // Extracting container name
+   std::string containerName = cfg.name;
+   script << "CONTAINER_NAME=\"" << containerName << "\"\n";
+   
+   // Extracting image name
+   std::string image = cfg.image.getStringSafe();
+   if (image.empty())
+   {
+      return "";
+   }
+   script << "IMAGE=\"" << image << "\"\n";
+   script << "podman pull $IMAGE\n";
+
+   // Extracting network
+   std::string network = cfg.network.getStringSafe();
+   if (!network.empty()) {
+       script << "NETWORK=\"--network=" << network << "\"\n";
+   } else {
+       script << "NETWORK=\"\"\n";
+   }
+
+   // Extracting entrypoint
+   std::string entrypoint = cfg.entrypoint.getStringSafe();
+   if (!entrypoint.empty()) {
+       script << "ENTRYPOINT=\"--entrypoint " << entrypoint << "\"\n";
+   } else {
+       script << "ENTRYPOINT=\"\"\n";
+   }
+
+   // Extracting ports
+   ExprObject* arrayList = cfg.portList.getObject();
+   if (arrayList)
+   {
+      script << "PORTS=\"";
+      arrayList->toList(tmpItems);
+      for (ExprValue& portMap : tmpItems)
+      {
+         if (!portMap.isString())
+         {
+            continue;
+         }
+         script << " -p " << portMap.getString();
+      }
+      script << "\"\n";
+   }
+
+   // Extracting volumes
+   arrayList = cfg.portList.getObject();
+   if (arrayList)
+   {
+      script << "VOLUMES=\"";
+      arrayList->toList(tmpItems);
+      for (ExprValue& portMap : tmpItems)
+      {
+         if (!portMap.isString())
+         {
+            continue;
+         }
+         script << " -v " << portMap.getString();
+      }
+      script << "\"\n";
+   }
+
+   // Extracting environment variables
+   script << "ENV_VARS=\"";
+   std::vector<std::string> envKeys;
+   cfg.env.getObject()->extractKeys(envKeys);
+   for (const auto& key : envKeys)
+   {
+       std::string value = cfg.env.getObject()->getMapKey(key.c_str()).getString();
+       script << " -e " << key << "=\"" << value << "\"";
+   }
+   script << "\"\n";
+
+   // Credentials (if needed for private registry)
+   ExprObject* credentials = cfg.credentials.getObject();
+   if (credentials)
+   {
+      std::string username = credentials->getMapKey("username").getStringSafe();
+      std::string password = credentials->getMapKey("password").getStringSafe();
+      if (!username.empty() && !password.empty())
+      {
+         script << "if ! podman login --get-login 2>/dev/null; then\n";
+         script << "  podman login --username " << username << " --password " << password << "\n";
+         script << "fi\n";
+      }
+   }
+
+   // Launch podman
+   script << "podman run -d --rm --name $CONTAINER_NAME \\\n        $NETWORK \\\n        $PORTS \\\n        $VOLUMES \\\n        $ENV_VARS \\\n        $ENTRYPOINT \\\n        $IMAGE";
+
+   return script.str();
+}
+
+// starts service, storing id in context info
+runner::v1::Result ServiceManager::start(Config& cfg, ServicesContext* ctx)
+{
+   SHLaunchEnv shEnv;
+   shEnv.mJobPrefix = mJobPrefix;
+   
+   if (!std::filesystem::is_directory(getLocalPrefix()))
+   {
+      std::filesystem::create_directory(getLocalPrefix());
+   }
+   
+   ShellExecutor shellExec(mState, &shEnv);
+   shellExec.setJobID(mJobID);
+   
+   std::string outID;
+   shellExec.setLogHandler([&outID](const char* data, size_t len) {
+      std::string sdata(data, len);
+      outID += sdata;
+   });
+   
+   runner::v1::Result res = shellExec.execute("", shEnv.getDefaultShell().c_str(), getLaunchScript(cfg), NULL, NULL, NULL, NULL);
+   if (res == runner::v1::RESULT_FAILURE)
+   {
+      return res;
+   }
+   
+   outID = Trim(outID);
+   if (outID == "")
+   {
+      return runner::v1::RESULT_FAILURE;
+   }
+   
+   mServiceID = outID;
+   ctx->mId.setString(*mState->mStringTable, outID.c_str());
+}
+
+// Waits until service is ready, optionally updating context info
+bool ServiceManager::waitReady(int timeout, ServicesContext* ctx)
+{
+   SHLaunchEnv shEnv;
+   shEnv.mJobPrefix = mJobPrefix;
+   
+   ShellExecutor shellExec(mState, &shEnv);
+   shellExec.setJobID(mJobID);
+   
+   runner::v1::Result res = shellExec.execute("", shEnv.getDefaultShell().c_str(), getWaitScript(mServiceID), NULL, NULL, NULL, NULL);
+   if (res == runner::v1::RESULT_FAILURE)
+   {
+      return false;
+   }
+   
+   return true;
+}
+
+// Stops service
+bool ServiceManager::stop()
+{
+   SHLaunchEnv shEnv;
+   shEnv.mJobPrefix = mJobPrefix;
+   
+   ShellExecutor shellExec(mState, &shEnv);
+   shellExec.setJobID(mJobID);
+   
+   std::string outID;
+   
+   runner::v1::Result res = shellExec.execute("", shEnv.getDefaultShell().c_str(), getStopScript(mServiceID), NULL, NULL, NULL, NULL);
+   if (res == runner::v1::RESULT_FAILURE)
+   {
+      return false;
+   }
+   
+   return true;
+}
+
+std::string ServiceManager::getLocalPrefix()
+{
+   return std::filesystem::temp_directory_path() / mJobPrefix;
+}
+
+std::string ServiceManager::getRemotePrefix()
+{
+   return "/tmp/input";
+}
+
+bool ServiceManager::getExecCommands(std::vector<std::string>& cmds, const std::string& envFile)
+{
+   if (mServiceID == "")
+   {
+      return false;
+   }
+   
+   cmds.push_back("podman");
+   cmds.push_back("exec");
+   cmds.push_back("--env-file");
+   cmds.push_back(envFile);
+   cmds.push_back("-it");
+   cmds.push_back(mServiceID);
+   return true;
+}
+
+void ServiceManager::cleanup()
+{
+   std::filesystem::path localFolder = std::filesystem::path(getLocalPrefix());
+   if (std::filesystem::is_directory(localFolder))
+   {
+      std::filesystem::remove_all(localFolder);
+   }
+}
 
 // Thread safe util class to handle updating a task.
 // Note that changes are effectively batched until HealthCheck dispatches API calls.
@@ -1303,7 +1665,7 @@ template<> void ExprFieldObject::registerFieldsForType<JobDefinition>()
    getFieldRegistry<JobDefinition>().insert(parentReg.begin(), parentReg.end());
    registerField<JobDefinition>("container", offsetof(JobDefinition, mContainer), ExprValue::OBJECT);
    registerField<JobDefinition>("strategy", offsetof(JobDefinition, mStrategy), ExprValue::STRING);
-   registerField<JobDefinition>("services", offsetof(JobDefinition, mServices), ExprValue::OBJECT);
+   registerField<JobDefinition>("services", offsetof(JobDefinition, mServices), ExprValue::OBJECT, false);
    registerField<JobDefinition>("permissions", offsetof(JobDefinition, mPermissions), ExprValue::OBJECT);
    registerField<JobDefinition>("defaults", offsetof(JobDefinition, mDefaults), ExprValue::OBJECT);
    registerField<JobDefinition>("steps", offsetof(JobDefinition, mSteps), ExprValue::OBJECT, false);
@@ -1314,6 +1676,38 @@ template<> void ExprFieldObject::registerFieldsForType<JobDefinition>()
 }
 
 struct JobStepContext;
+
+struct JobServiceDefinition : public ExprFieldObject
+{
+   typedef BasicContext Parent;
+   
+   ExprValue mImage;
+   ExprValue mCredentials;
+   ExprValue mPorts;
+   ExprValue mOptions;
+   ExprValue mEnv;
+   ExprValue mVolumes;
+   ExprValue mNetwork;
+   ExprValue mHealthCheck;
+   
+   JobServiceDefinition(ExprState* state) : ExprFieldObject(state)
+   {
+   }
+   
+   std::unordered_map<std::string, FieldRef>& getObjectFieldRegistry() override { return getFieldRegistry<JobServiceDefinition>(); }
+};
+
+template<> void ExprFieldObject::registerFieldsForType<JobServiceDefinition>()
+{
+   registerField<JobServiceDefinition>("image", offsetof(JobServiceDefinition, mImage), ExprValue::STRING);
+   registerField<JobServiceDefinition>("credentials", offsetof(JobServiceDefinition, mCredentials), ExprValue::OBJECT);
+   registerField<JobServiceDefinition>("ports", offsetof(JobServiceDefinition, mPorts), ExprValue::OBJECT);
+   registerField<JobServiceDefinition>("options", offsetof(JobServiceDefinition, mOptions), ExprValue::STRING);
+   registerField<JobServiceDefinition>("env", offsetof(JobServiceDefinition, mEnv), ExprValue::OBJECT);
+   registerField<JobServiceDefinition>("volumes", offsetof(JobServiceDefinition, mVolumes), ExprValue::OBJECT);
+   registerField<JobServiceDefinition>("network", offsetof(JobServiceDefinition, mNetwork), ExprValue::STRING);
+   registerField<JobServiceDefinition>("health-check", offsetof(JobServiceDefinition, mHealthCheck), ExprValue::STRING);
+}
 
 struct JobStepsState
 {
@@ -1713,6 +2107,9 @@ JobDefinition::JobDefinition(ExprState* state) : BasicContext(state)
    ExprArray* jobArray = new ExprArray(state);
    jobArray->mAddObjectFunc = ExprArray::addTypedObjectFunc<JobStepDefinition>;
    mSteps = ExprValue().setObject(jobArray);
+   ExprMap* serviceMap = new ExprMap(state);
+   serviceMap->mAddObjectFunc = ExprMap::addTypedObjectFunc<JobServiceDefinition>;
+   mServices = ExprValue().setObject(serviceMap);
 }
 
 
@@ -2170,6 +2567,7 @@ public:
    TaskTracker* mTask;
    int32_t mCurrentStep;
    int32_t mNumSteps;
+   std::vector<ServiceManager*> mServices;
    
    JobExecutor() : mState(NULL), mJob(NULL), mTask(NULL), mCurrentStep(0), mNumSteps(0)
    {
@@ -2177,6 +2575,57 @@ public:
    
    virtual ~JobExecutor()
    {
+      cleanupServices();
+   }
+   
+   static void jsdToConfig(ServiceManager::Config& cfg)
+   {
+      // TODO
+   }
+   
+   virtual bool setupServices()
+   {
+      std::vector<std::string> keys;
+      mJob->mServices.getObject()->extractKeys(keys);
+      CurrentJobContext* jobCtx = dynamic_cast<CurrentJobContext*>(mState->getContext("job"));
+      if (jobCtx == NULL)
+      {
+         return false;
+      }
+      
+      for (const std::string& val : keys)
+      {
+         JobServiceDefinition* jsd = mJob->mServices.getObject()->getMapKey(val).asObject<JobServiceDefinition>();
+         if (jsd != NULL)
+         {
+            ServiceManager* mgr = new ServiceManager(mState);
+            mServices.push_back(mgr);
+            ServicesContext* ctx = new ServicesContext(mState);
+            jobCtx->mServices.getObject()->setMapKey(val, ExprValue().setObject(ctx));
+            
+            ServiceManager::Config cfg;
+            jsdToConfig(cfg);
+            
+            if (mgr->start(cfg, ctx) != runner::v1::RESULT_SUCCESS)
+            {
+               return false;
+            }
+         }
+      }
+      
+      return true;
+   }
+   
+   void cleanupServices()
+   {
+      for (ServiceManager* mgr : mServices)
+      {
+         mgr->stop();
+         mgr->cleanup();
+         delete mgr;
+      }
+      
+      mServices.clear();
    }
    
    void finishTask(runner::v1::Result result, const char* endMessage)
@@ -2269,11 +2718,11 @@ public:
       
       TaskTracker* task = mTask;
       ShellExecutor shellExec(mState, theEnv);
-      shellExec.mJobID = std::to_string(mTask->_getTask().id());
-      shellExec.mLogHandler = [task](const char* data, size_t len) {
+      shellExec.setJobID(std::to_string(mTask->_getTask().id()));
+      shellExec.setLogHandler([task](const char* data, size_t len) {
          std::string sdata(data, len);
          task->log(sdata.c_str());
-      };
+      });
       
       std::string cwd = mStepState.definition->mCwd.getString() ? mStepState.definition->mCwd.getString() : std::filesystem::current_path().c_str();
       std::string shell = mStepState.definition->mShell.getString() ? mStepState.definition->mShell.getString() : "/bin/bash";
@@ -2285,12 +2734,25 @@ public:
    
 };
 
+// Variant of JobStepExecutor which runs command inside a container
+class ContainerStepExecutor : public JobStepExecutor
+{
+   
+};
+
 class StandardJobExecutor : public JobExecutor
 {
 public:
+   
    virtual void handleJob()
    {
       SetupExprState(mTask, mState);
+      if (!setupServices())
+      {
+         finishTask(runner::v1::RESULT_FAILURE, "Services failed to start");
+         cleanupServices();
+         return;
+      }
       
       // Gen step contexts
       JobStepsState stepState;
@@ -2314,6 +2776,7 @@ public:
          if (conditionalValue.getBool() == false)
          {
             finishTask(runner::v1::RESULT_SKIPPED, "Job conditional test failed");
+            cleanupServices();
             return;
          }
          else
@@ -2323,6 +2786,8 @@ public:
       }
       
       performTaskSteps(stepState);
+      
+      cleanupServices();
    }
    
    void performTaskSteps(JobStepsState& stepState)
@@ -2508,6 +2973,8 @@ int main(int argc, char** argv)
    ExprFieldObject::registerFieldsForType<JobResultContext>();
    ExprFieldObject::registerFieldsForType<CurrentJobContext>();
    ExprFieldObject::registerFieldsForType<RunnerInfo>();
+   ExprFieldObject::registerFieldsForType<ServicesContext>();
+   ExprFieldObject::registerFieldsForType<JobServiceDefinition>();
    
    JobExecutor::registerExecutor("default", JobExecutor::createExecutor<StandardJobExecutor>);
    JobStepExecutor::registerExecutor("default", JobStepExecutor::createExecutor<StandardStepExecutor>);
