@@ -70,6 +70,8 @@ struct RunnerState
    std::string endpoint;
    std::string uuid;
    std::string token;
+   std::string localWorkspaceRoot;
+   std::string remoteWorkspaceRoot;
    runner::v1::Runner info;
    std::unordered_map<std::string, std::string> env;
 };
@@ -260,13 +262,19 @@ struct LaunchEnv
    ServiceManager* mService; 
    std::string mTempFilePrefix; // std::to_string(GET_PID()) + "-run-" + mJobID
    std::vector<std::string> mTempLaunchEnv;
+   std::string mWorkingDirectory;
    
-   LaunchEnv() : mService(NULL)
+   LaunchEnv() : mService(NULL), mWorkingDirectory("")
    {
    }
    
    virtual ~LaunchEnv()
    {
+   }
+   
+   std::string getWorkingDirectory()
+   {
+      return mWorkingDirectory;
    }
    
    virtual std::string getDefaultShell()
@@ -393,6 +401,7 @@ template<> void ExprFieldObject::registerFieldsForType<ServicesContext>()
    registerField<ServicesContext>("ports", offsetof(ServicesContext, mPorts), ExprValue::OBJECT);
 }
 
+class TaskTracker;
 
 class ServiceManager
 {
@@ -415,6 +424,9 @@ public:
       std::string name; // launch name
       std::string id; // [key]
       std::string label; // launch label
+      std::string workspaceLocal;
+      std::string workspaceRemote;
+      std::string tmpMount; // folder on local machine for tmp mount
       Mode mode;
    };
    
@@ -422,12 +434,13 @@ protected:
    std::string mJobID;     // id of job
    std::string mFolderPrefix; // prefix of temp files for job (usually prefixed by service folder)
    std::string mServiceID; // id of container
+   TaskTracker* mTask;
    ExprState* mState;
    std::mutex mMutex;
    
 public:
    
-   ServiceManager(ExprState* state, const std::string& jobID, const std::string& tempPrefix);
+   ServiceManager(TaskTracker* task, ExprState* state, const std::string& jobID, const std::string& tempPrefix);
    
    static std::string getWaitScript(const std::string& ident);
    
@@ -599,14 +612,21 @@ public:
       }
    }
    
-   runner::v1::Result execute(const std::string& cwd,
-                              const std::string& shell,
+   runner::v1::Result execute(const std::string& shell,
                               const std::string& cmdList,
                               ExprMultiKey* env,
                               ExprObject* outEnv,
                               ExprObject* outputs,
                               ExprObject* outPaths)
    {
+      if (mLaunchEnv->getWorkingDirectory().empty())
+      {
+         printf("Working directory not set in env\n");
+         return runner::v1::RESULT_FAILURE;
+      }
+      
+      std::string cwd = mLaunchEnv->getWorkingDirectory();
+      
       // Define the file name
       mLaunchEnv->mTempFilePrefix = MakeTempPrefix(mJobID);
       mLaunchEnv->cleanup();
@@ -672,14 +692,25 @@ public:
                                         procFlags, procEnv,
                                         &mSubprocess);
       
-      pollLogs();
+      int process_return = 1;
       
-      int process_return = 0;
-      subprocess_join(&mSubprocess, &process_return);
+      if (result >= 0)
+      {
+         pollLogs();
+         
+         process_return = 0;
+         subprocess_join(&mSubprocess, &process_return);
       
-      //
+         //
       
-      processOutput(outEnv, outputs, outPaths);
+         processOutput(outEnv, outputs, outPaths);
+      }
+      else if (mLogHandler)
+      {
+         const char* err = "Unknown error launching process\n";
+         mLogHandler(err, strlen(err));
+      }
+      
       mLaunchEnv->cleanup();
       
       return process_return != 0 ?  runner::v1::RESULT_FAILURE : runner::v1::RESULT_SUCCESS;
@@ -836,261 +867,8 @@ public:
 };
 
 std::string Trim(const std::string &str);
-   
-ServiceManager::ServiceManager(ExprState* state, 
-                               const std::string& jobID,
-                               const std::string& tempPrefix) :
-mState(state),
-mJobID(jobID),
-mFolderPrefix(tempPrefix)
-{
-}
 
-std::string ServiceManager::getWaitScript(const std::string& ident)
-{
-   std::ostringstream script;
-   script << "set -e\n\n";
-   script << "podman wait --condition healthy " << ident << std::endl;
-   return script.str();
-}
-
-std::string ServiceManager::getStopScript(const std::string& ident)
-{
-   std::ostringstream script;
-   script << "podman stop " << ident << std::endl;
-   script << "podman rm " << ident << std::endl;
-   return script.str();
-}
-
-std::string ServiceManager::getLaunchScript(Config& cfg)
-{
-   std::ostringstream script;
-   std::vector<ExprValue> tmpItems;
-   script << "set -e\n\n";
-   
-   // Extracting container name
-   std::string containerName = cfg.name;
-   script << "CONTAINER_NAME=\"" << containerName << "\"\n";
-   
-   // Extracting image name
-   std::string image = cfg.image.getStringSafe();
-   if (image.empty())
-   {
-      return "";
-   }
-   script << "IMAGE=\"" << image << "\"\n";
-   script << "podman pull $IMAGE\n";
-
-   // Extracting network
-   std::string network = cfg.network.getStringSafe();
-   if (!network.empty()) {
-       script << "NETWORK=\"--network=" << network << "\"\n";
-   } else {
-       script << "NETWORK=\"\"\n";
-   }
-   
-   std::string label = cfg.name;
-   if (!cfg.label.empty()) {
-       script << "CONTAINER_LABEL=\"--label " << network << "=true\"\n";
-   } else {
-       script << "CONTAINER_LABEL=\"\"\n";
-   }
-
-   // Extracting ports
-   ExprObject* arrayList = cfg.portList.getObject();
-   if (arrayList)
-   {
-      script << "PORTS=\"";
-      arrayList->toList(tmpItems);
-      for (ExprValue& portMap : tmpItems)
-      {
-         if (!portMap.isString())
-         {
-            continue;
-         }
-         script << " -p " << portMap.getString();
-      }
-      script << "\"\n";
-   }
-
-   // Extracting volumes
-   arrayList = cfg.portList.getObject();
-   if (arrayList)
-   {
-      script << "VOLUMES=\"";
-      arrayList->toList(tmpItems);
-      for (ExprValue& portMap : tmpItems)
-      {
-         if (!portMap.isString())
-         {
-            continue;
-         }
-         script << " -v " << portMap.getString();
-      }
-      script << "\"\n";
-   }
-
-   // Extracting environment variables
-   script << "ENV_VARS=\"";
-   std::vector<std::string> envKeys;
-   if (cfg.env.getObject())
-   {
-      cfg.env.getObject()->extractKeys(envKeys);
-      for (const auto& key : envKeys)
-      {
-         std::string value = cfg.env.getObject()->getMapKey(key.c_str()).getString();
-         script << " -e " << key << "=\"" << value << "\"";
-      }
-   }
-   script << "\"\n";
-
-   // Credentials (if needed for private registry)
-   ExprObject* credentials = cfg.credentials.getObject();
-   if (credentials)
-   {
-      std::string username = credentials->getMapKey("username").getStringSafe();
-      std::string password = credentials->getMapKey("password").getStringSafe();
-      if (!username.empty() && !password.empty())
-      {
-         script << "if ! podman login --get-login 2>/dev/null; then\n";
-         script << "  podman login --username " << username << " --password " << password << "\n";
-         script << "fi\n";
-      }
-   }
-
-   // Launch podman
-   script << "CONTAINER_ID=$(podman run -q -d --rm $CONTAINER_LABEL --name $CONTAINER_NAME \\\n        $NETWORK \\\n        $PORTS \\\n        $VOLUMES \\\n        $ENV_VARS \\\n        $IMAGE)\n";
-   
-   script << "echo \"id=$CONTAINER_ID\" >> $GITHUB_OUTPUT\n";
-
-   return script.str();
-}
-
-// starts service, storing id in context info
-runner::v1::Result ServiceManager::start(Config& cfg, ServicesContext* ctx)
-{
-   SHLaunchEnv shEnv;
-   shEnv.mTempFilePrefix = MakeTempPrefix(mJobID);
-   
-   if (ctx == NULL)
-   {
-      return runner::v1::RESULT_FAILURE;
-   }
-   
-   if (!std::filesystem::is_directory(getLocalPrefix()))
-   {
-      printf("SERVICE: creating directory=%s\n", getLocalPrefix().c_str());
-      std::filesystem::create_directory(getLocalPrefix());
-   }
-   
-   ShellExecutor shellExec(mState, &shEnv, mJobID);
-   
-   std::string outID;
-   shellExec.setLogHandler([&outID](const char* data, size_t len) {
-      std::string sdata(data, len);
-      outID += sdata;
-   });
-   
-   ExprMultiKey* env = (ExprMultiKey*)mState->getContext("env");
-   env->mSlots[REnv_Step] = new ExprMap(mState);
-   runner::v1::Result res = shellExec.execute(std::filesystem::temp_directory_path().string(),
-                                              shEnv.getDefaultShell().c_str(),
-                                              getLaunchScript(cfg),
-                                              env, NULL, ctx, NULL);
-   env->mSlots[REnv_Step] = NULL;
-   
-   if (res == runner::v1::RESULT_FAILURE)
-   {
-      return res;
-   }
-   
-   mServiceID = ctx->mId.getStringSafe();
-   
-   if (mServiceID == "")
-   {
-      return runner::v1::RESULT_FAILURE;
-   }
-   
-   return res;
-}
-
-// Waits until service is ready, optionally updating context info
-bool ServiceManager::waitReady(int timeout, ServicesContext* ctx)
-{
-   SHLaunchEnv shEnv;
-   shEnv.mTempFilePrefix = MakeTempPrefix(mJobID);
-   
-   ShellExecutor shellExec(mState, &shEnv, mJobID);
-   
-   runner::v1::Result res = shellExec.execute(std::filesystem::temp_directory_path().string(), 
-                                              shEnv.getDefaultShell().c_str(),
-                                              getWaitScript(mServiceID),
-                                              NULL, NULL, NULL, NULL);
-   if (res == runner::v1::RESULT_FAILURE)
-   {
-      return false;
-   }
-   
-   return true;
-}
-
-// Stops service
-bool ServiceManager::stop()
-{
-   SHLaunchEnv shEnv;
-   shEnv.mTempFilePrefix = MakeTempPrefix(mJobID);
-   
-   ShellExecutor shellExec(mState, &shEnv, mJobID);
-   
-   std::string outID;
-   
-   runner::v1::Result res = shellExec.execute(std::filesystem::temp_directory_path().string(),
-                                              shEnv.getDefaultShell().c_str(), 
-                                              getStopScript(mServiceID),
-                                              NULL, NULL, NULL, NULL);
-   if (res == runner::v1::RESULT_FAILURE)
-   {
-      return false;
-   }
-   
-   return true;
-}
-
-std::string ServiceManager::getLocalPrefix()
-{
-   return std::filesystem::temp_directory_path() / mFolderPrefix;
-}
-
-std::string ServiceManager::getRemotePrefix()
-{
-   return "/tmp/input";
-}
-
-bool ServiceManager::getExecCommands(std::vector<std::string>& cmds, const std::string& envFile)
-{
-   if (mServiceID == "")
-   {
-      return false;
-   }
-   
-   cmds.push_back("podman");
-   cmds.push_back("exec");
-   cmds.push_back("--env-file");
-   cmds.push_back(envFile);
-   cmds.push_back("-it");
-   cmds.push_back(mServiceID);
-   return true;
-}
-
-void ServiceManager::cleanup()
-{
-   std::filesystem::path localFolder = std::filesystem::path(getLocalPrefix());
-   if (std::filesystem::is_directory(localFolder))
-   {
-      printf("SERVICE: removing directory=%s\n", localFolder.c_str());
-      std::filesystem::remove_all(localFolder);
-   }
-}
+class TaskTracker;
 
 // Thread safe util class to handle updating a task.
 // Note that changes are effectively batched until HealthCheck dispatches API calls.
@@ -1412,6 +1190,284 @@ public:
    }
 };
 
+ServiceManager::ServiceManager(TaskTracker* task,
+                               ExprState* state,
+                               const std::string& jobID,
+                               const std::string& tempPrefix) :
+mTask(task),
+mState(state),
+mJobID(jobID),
+mFolderPrefix(tempPrefix)
+{
+}
+
+std::string ServiceManager::getWaitScript(const std::string& ident)
+{
+   std::ostringstream script;
+   script << "set -e\n\n";
+   script << "podman wait --condition healthy " << ident << std::endl;
+   return script.str();
+}
+
+std::string ServiceManager::getStopScript(const std::string& ident)
+{
+   std::ostringstream script;
+   script << "podman stop " << ident << std::endl;
+   script << "podman rm " << ident << std::endl;
+   return script.str();
+}
+
+std::string ServiceManager::getLaunchScript(Config& cfg)
+{
+   std::ostringstream script;
+   std::vector<ExprValue> tmpItems;
+   script << "set -e\n\n";
+   
+   // Extracting container name
+   std::string containerName = cfg.name;
+   script << "CONTAINER_NAME=\"" << containerName << "\"\n";
+   
+   // Extracting image name
+   std::string image = cfg.image.getStringSafe();
+   if (image.empty())
+   {
+      return "";
+   }
+   script << "IMAGE=\"" << image << "\"\n";
+   script << "podman pull $IMAGE\n";
+   
+   // Extracting network
+   std::string network = cfg.network.getStringSafe();
+   if (!network.empty()) {
+      script << "NETWORK=\"--network=" << network << "\"\n";
+   } else {
+      script << "NETWORK=\"\"\n";
+   }
+   
+   std::string label = cfg.name;
+   if (!cfg.label.empty()) {
+      script << "CONTAINER_LABEL=\"--label " << network << "=true\"\n";
+   } else {
+      script << "CONTAINER_LABEL=\"\"\n";
+   }
+   
+   // Extracting ports
+   ExprObject* arrayList = cfg.portList.getObject();
+   if (arrayList)
+   {
+      script << "PORTS=\"";
+      arrayList->toList(tmpItems);
+      for (ExprValue& portMap : tmpItems)
+      {
+         if (!portMap.isString())
+         {
+            continue;
+         }
+         script << " -p " << portMap.getString();
+      }
+      script << "\"\n";
+   }
+   
+   // Extracting volumes
+   script << "VOLUMES=\"";
+   arrayList = cfg.portList.getObject();
+   if (arrayList)
+   {
+      arrayList->toList(tmpItems);
+      for (ExprValue& portMap : tmpItems)
+      {
+         if (!portMap.isString())
+         {
+            continue;
+         }
+         script << " -v " << portMap.getString();
+      }
+   }
+   if (!cfg.workspaceLocal.empty() && !cfg.workspaceRemote.empty())
+   {
+      script << " -v " << cfg.workspaceLocal << ":";
+      script << cfg.workspaceRemote;
+      script << " ";
+   }
+   if (!cfg.tmpMount.empty())
+   {
+      script << " -v " << cfg.tmpMount << ":";
+      script << "/tmp/input ";
+   }
+   script << "\"\n";
+   
+   // Extracting environment variables
+   script << "ENV_VARS=\"";
+   std::vector<std::string> envKeys;
+   if (cfg.env.getObject())
+   {
+      cfg.env.getObject()->extractKeys(envKeys);
+      for (const auto& key : envKeys)
+      {
+         std::string value = cfg.env.getObject()->getMapKey(key.c_str()).getString();
+         script << " -e " << key << "=\"" << value << "\"";
+      }
+   }
+   script << "\"\n";
+   
+   // Credentials (if needed for private registry)
+   ExprObject* credentials = cfg.credentials.getObject();
+   if (credentials)
+   {
+      std::string username = credentials->getMapKey("username").getStringSafe();
+      std::string password = credentials->getMapKey("password").getStringSafe();
+      if (!username.empty() && !password.empty())
+      {
+         script << "if ! podman login --get-login 2>/dev/null; then\n";
+         script << "  podman login --username " << username << " --password " << password << "\n";
+         script << "fi\n";
+      }
+   }
+   
+   script << "ENTRYPOINT=";
+   if (cfg.mode == Config::CONTAINER)
+   {
+      script << "\"--entrypoint [\\\"tail\\\",\\\"-f\\\",\\\"/dev/null\\\"]\"";
+   }
+   script << "\n";
+   
+   // Launch podman
+   script << "CONTAINER_ID=$(podman run -q -d --rm $CONTAINER_LABEL --name $CONTAINER_NAME \\\n        $NETWORK \\\n        $PORTS \\\n        $VOLUMES \\\n        $ENV_VARS \\\n $ENTRYPOINT        $IMAGE)\n";
+   
+   script << "echo \"id=$CONTAINER_ID\" >> $GITHUB_OUTPUT\n";
+   
+   return script.str();
+}
+
+// starts service, storing id in context info
+runner::v1::Result ServiceManager::start(Config& cfg, ServicesContext* ctx)
+{
+   SHLaunchEnv shEnv;
+   shEnv.mTempFilePrefix = MakeTempPrefix(mJobID);
+   shEnv.mWorkingDirectory = mTask->_getRunner().localWorkspaceRoot;
+   
+   if (ctx == NULL)
+   {
+      return runner::v1::RESULT_FAILURE;
+   }
+   
+   if (!std::filesystem::is_directory(getLocalPrefix()))
+   {
+      printf("SERVICE: creating directory=%s\n", getLocalPrefix().c_str());
+      std::filesystem::create_directory(getLocalPrefix());
+   }
+   
+   // Make sure config includes volume mount for tmp
+   cfg.tmpMount = getLocalPrefix();
+   
+   ShellExecutor shellExec(mState, &shEnv, mJobID);
+   
+   TaskTracker* task = mTask;
+   shellExec.setLogHandler([task](const char* data, size_t len) {
+      std::string sdata(data, len);
+      task->log(sdata.c_str());
+   });
+   
+   ExprMultiKey* env = (ExprMultiKey*)mState->getContext("env");
+   env->mSlots[REnv_Step] = new ExprMap(mState);
+   runner::v1::Result res = shellExec.execute(shEnv.getDefaultShell().c_str(),
+                                              getLaunchScript(cfg),
+                                              env, NULL, ctx, NULL);
+   env->mSlots[REnv_Step] = NULL;
+   
+   if (res == runner::v1::RESULT_FAILURE)
+   {
+      return res;
+   }
+   
+   mServiceID = ctx->mId.getStringSafe();
+   
+   if (mServiceID == "")
+   {
+      return runner::v1::RESULT_FAILURE;
+   }
+   
+   return res;
+}
+
+// Waits until service is ready, optionally updating context info
+bool ServiceManager::waitReady(int timeout, ServicesContext* ctx)
+{
+   SHLaunchEnv shEnv;
+   shEnv.mTempFilePrefix = MakeTempPrefix(mJobID);
+   shEnv.mWorkingDirectory = mTask->_getRunner().localWorkspaceRoot;
+   
+   ShellExecutor shellExec(mState, &shEnv, mJobID);
+   
+   runner::v1::Result res = shellExec.execute(shEnv.getDefaultShell().c_str(),
+                                              getWaitScript(mServiceID),
+                                              NULL, NULL, NULL, NULL);
+   if (res == runner::v1::RESULT_FAILURE)
+   {
+      return false;
+   }
+   
+   return true;
+}
+
+// Stops service
+bool ServiceManager::stop()
+{
+   SHLaunchEnv shEnv;
+   shEnv.mTempFilePrefix = MakeTempPrefix(mJobID);
+   shEnv.mWorkingDirectory = mTask->_getRunner().localWorkspaceRoot;
+   
+   ShellExecutor shellExec(mState, &shEnv, mJobID);
+   
+   std::string outID;
+   
+   runner::v1::Result res = shellExec.execute(shEnv.getDefaultShell().c_str(),
+                                              getStopScript(mServiceID),
+                                              NULL, NULL, NULL, NULL);
+   if (res == runner::v1::RESULT_FAILURE)
+   {
+      return false;
+   }
+   
+   return true;
+}
+
+std::string ServiceManager::getLocalPrefix()
+{
+   return std::filesystem::temp_directory_path() / mFolderPrefix;
+}
+
+std::string ServiceManager::getRemotePrefix()
+{
+   return "/tmp/input";
+}
+
+bool ServiceManager::getExecCommands(std::vector<std::string>& cmds, const std::string& envFile)
+{
+   if (mServiceID == "")
+   {
+      return false;
+   }
+   
+   cmds.push_back("podman");
+   cmds.push_back("exec");
+   cmds.push_back("--env-file");
+   cmds.push_back(envFile);
+   cmds.push_back("-it");
+   cmds.push_back(mServiceID);
+   return true;
+}
+
+void ServiceManager::cleanup()
+{
+   std::filesystem::path localFolder = std::filesystem::path(getLocalPrefix());
+   if (std::filesystem::is_directory(localFolder))
+   {
+      printf("SERVICE: removing directory=%s\n", localFolder.c_str());
+      std::filesystem::remove_all(localFolder);
+   }
+}
+
 // Sets up runner
 bool SetupRunner(CURL *curl, RunnerState& state, int argc, char** argv)
 {
@@ -1431,6 +1487,8 @@ bool SetupRunner(CURL *curl, RunnerState& state, int argc, char** argv)
    std::string version = "1.0";
    std::vector<std::string> labels;
    state.endpoint = "http://localhost:3000";
+   state.localWorkspaceRoot = std::filesystem::current_path();
+   state.remoteWorkspaceRoot = "/workspace";
    
    // Parse args
    for (int i = 1; i < argc; ++i) 
@@ -1458,6 +1516,14 @@ bool SetupRunner(CURL *curl, RunnerState& state, int argc, char** argv)
       else if (strcmp(argv[i], "--url") == 0 && i + 1 < argc)
       {
          state.endpoint = argv[++i];
+      }
+      else if (strcmp(argv[i], "--local-workspace-root") == 0 && i + 1 < argc)
+      {
+         state.localWorkspaceRoot = argv[++i];
+      }
+      else if (strcmp(argv[i], "--remote-workspace-root") == 0 && i + 1 < argc)
+      {
+         state.remoteWorkspaceRoot = argv[++i];
       }
       else if (strcmp(argv[i], "--env") == 0 && i + 1 < argc)
       {
@@ -2685,7 +2751,8 @@ public:
    bool setupService(CurrentJobContext* jobCtx, ServiceManager::Config& cfg)
    {
       std::string jobID = std::to_string(mTask->_getTask().id());
-      ServiceManager* mgr = new ServiceManager(mState,
+      ServiceManager* mgr = new ServiceManager(mTask,
+                                               mState,
                                                jobID,
                                                MakeTempPrefix(jobID + "-svc-" + cfg.name));
       mServices.push_back(mgr);
@@ -2748,7 +2815,7 @@ public:
    virtual bool setupContainer()
    {
       JobServiceDefinition* containerInfo = mJob->mContainer.asObject<JobServiceDefinition>();
-      if (containerInfo == NULL || *containerInfo->mImage.getStringSafe() == '\0')
+      if (mRunService || containerInfo == NULL || *containerInfo->mImage.getStringSafe() == '\0')
       {
          return true;
       }
@@ -2762,11 +2829,15 @@ public:
       
       jsdToConfig(*containerInfo, cfg, label, network);
       cfg.label = label;
+      cfg.workspaceLocal = mTask->_getRunner().localWorkspaceRoot;
+      cfg.workspaceRemote = mTask->_getRunner().remoteWorkspaceRoot;
       
       if (!setupService(jobCtx, cfg))
       {
          return false;
       }
+      
+      mRunService = mServices[mServices.size()-1];
       
       return true;
    }
@@ -2781,6 +2852,7 @@ public:
       }
       
       mServices.clear();
+      mRunService = NULL;
    }
    
    void finishTask(runner::v1::Result result, const char* endMessage)
@@ -2866,6 +2938,7 @@ public:
       PSHLaunchEnv psEnv;
       LaunchEnv* theEnv = &shEnv;
       theEnv->mService = mStepState.service; // associated service to run inside
+      shEnv.mWorkingDirectory = theEnv->mService ? mTask->_getRunner().remoteWorkspaceRoot : mTask->_getRunner().localWorkspaceRoot;
       
       if (isPowerShell)
       {
@@ -2879,10 +2952,14 @@ public:
          task->log(sdata.c_str());
       });
       
-      std::string cwd = mStepState.definition->mCwd.getString() ? mStepState.definition->mCwd.getString() : std::filesystem::current_path().c_str();
-      std::string shell = mStepState.definition->mShell.getString() ? mStepState.definition->mShell.getString() : "/bin/bash";
+      if (mStepState.definition->mCwd.getString())
+      {
+         theEnv->mWorkingDirectory = mStepState.definition->mCwd.getString();
+      }
       
-      shellExec.execute(cwd, shell, cmdToRun, mStepState.env, mStepState.outputEnv, mStepState.outputStep, mStepState.outputPath);
+      std::string shell = mStepState.definition->mShell.getString() ? mStepState.definition->mShell.getString() : theEnv->getDefaultShell();
+      
+      shellExec.execute(shell, cmdToRun, mStepState.env, mStepState.outputEnv, mStepState.outputStep, mStepState.outputPath);
       
       return runner::v1::RESULT_SUCCESS;
    }
