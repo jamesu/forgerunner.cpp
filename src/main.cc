@@ -54,10 +54,11 @@ using namespace google::protobuf::util;
 
 enum
 {
-   REnv_Core=0,
-   REnv_Workflow=1,
-   REnv_Job=2,
-   REnv_Step=3,
+   REnv_Local=0,
+   REnv_Core=1,
+   REnv_Workflow=2,
+   REnv_Job=3,
+   REnv_Step=4,
    REnv_Force,
    REnv_COUNT
 };
@@ -70,6 +71,7 @@ struct RunnerState
    std::string uuid;
    std::string token;
    runner::v1::Runner info;
+   std::unordered_map<std::string, std::string> env;
 };
 
 const char* RunnerStatusToString(runner::v1::RunnerStatus status)
@@ -294,7 +296,7 @@ struct LaunchEnv
    {
       return false;
    }
-   virtual void prepareEnv(ExprObject* env)
+   virtual void prepareEnv(ExprMultiKey* env)
    {
    }
    
@@ -710,11 +712,14 @@ public:
       return mService ? mService->getRemotePrefix() : std::filesystem::temp_directory_path().string();
    }
    
-   void prepareEnv(ExprObject* env) override
+   void prepareEnv(ExprMultiKey* env) override
    {
       if (mService)
       {
+         ExprObject* localEnv = env->mSlots[REnv_Local];
+         env->mSlots[REnv_Local] = NULL;
          dumpEnvToFile(env, (std::filesystem::path(getLocalPrefix()) / (mTempFilePrefix + ".env")));
+         env->mSlots[REnv_Local] = localEnv;
       }
       else
       {
@@ -779,7 +784,7 @@ public:
       return mService ? mService->getRemotePrefix() : std::filesystem::temp_directory_path().string();
    }
    
-   void prepareEnv(ExprObject* env) override
+   void prepareEnv(ExprMultiKey* env) override
    {
       if (mService)
       {
@@ -982,7 +987,7 @@ runner::v1::Result ServiceManager::start(Config& cfg, ServicesContext* ctx)
    runner::v1::Result res = shellExec.execute(std::filesystem::temp_directory_path().string(), 
                                               shEnv.getDefaultShell().c_str(),
                                               getLaunchScript(cfg),
-                                              NULL, NULL, NULL, NULL);
+                                              (ExprMultiKey*)mState->getContext("env"), NULL, NULL, NULL);
    if (res == runner::v1::RESULT_FAILURE)
    {
       return res;
@@ -1420,20 +1425,43 @@ bool SetupRunner(CURL *curl, RunnerState& state, int argc, char** argv)
    state.endpoint = "http://localhost:3000";
    
    // Parse args
-   for (int i = 1; i < argc; ++i) {
-      if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) {
+   for (int i = 1; i < argc; ++i) 
+   {
+      if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) 
+      {
          name = argv[++i];
-      } else if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) {
+      } 
+      else if (strcmp(argv[i], "--token") == 0 && i + 1 < argc)
+      {
          token = argv[++i];
-      } else if (strcmp(argv[i], "--version") == 0 && i + 1 < argc) {
+      } 
+      else if (strcmp(argv[i], "--version") == 0 && i + 1 < argc)
+      {
          version = argv[++i];
-      } else if (strcmp(argv[i], "--label") == 0 && i + 1 < argc) {
+      } 
+      else if (strcmp(argv[i], "--label") == 0 && i + 1 < argc)
+      {
          labels.push_back(argv[++i]);
-      } else if (strcmp(argv[i], "--uuid") == 0 && i + 1 < argc) {
+      } 
+      else if (strcmp(argv[i], "--uuid") == 0 && i + 1 < argc)
+      {
          state.uuid = argv[++i];
-      } else if (strcmp(argv[i], "--url") == 0 && i + 1 < argc) {
+      }
+      else if (strcmp(argv[i], "--url") == 0 && i + 1 < argc)
+      {
          state.endpoint = argv[++i];
-      } else {
+      }
+      else if (strcmp(argv[i], "--env") == 0 && i + 1 < argc)
+      {
+         std::string kv = argv[++i];
+         size_t pos = kv.find('=');
+         if (pos != std::string::npos)
+         {
+            state.env[kv.substr(0, pos)] = kv.substr(pos + 1);
+         }
+      } 
+      else 
+      {
          printf("Unknown argument: %s\n", argv[i]);
          return false;
       }
@@ -2562,6 +2590,13 @@ void SetupExprState(TaskTracker* currentTask, ExprState* exprState)
    exprState->setContext("matrix", new ExprMap(exprState));
    
    // Setup core env
+   ExprMap* localMap = new ExprMap(exprState);
+   for (auto& itr : currentTask->_getRunner().env)
+   {
+      localMap->setMapKey(itr.first, ExprValue().setString(*exprState->mStringTable, itr.second.c_str()));
+   }
+   env->mSlots[REnv_Local] = localMap;
+   
    coreEnv->setMapKey("GITHUB_ACTION",gitContext->getMapKey("action"));
    coreEnv->setMapKey("GITHUB_ACTIONS", ExprValue().setBool(false));
    coreEnv->setMapKey("GITHUB_ACTOR", ExprValue().setString(*exprState->mStringTable, "unknown"));
