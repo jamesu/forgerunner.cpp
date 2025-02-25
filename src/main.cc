@@ -462,6 +462,8 @@ public:
    
    bool getExecCommands(std::vector<std::string>& cmds, const std::string& envFile);
    
+   void getLaunchEnv(std::vector<std::string>& env);
+   
    void cleanup();
 };
 
@@ -668,11 +670,13 @@ public:
       for (const std::string& str : launchCmdsS)
       {
          launchCmdsC.push_back(str.c_str());
+         printf("CMD:%s\n", str.c_str());
       }
       launchCmdsC.push_back(NULL);
       for (const std::string& str : envS)
       {
          envC.push_back(str.c_str());
+         printf("ENV:%s\n",str.c_str());
       }
       envC.push_back(NULL);
       
@@ -789,6 +793,7 @@ public:
          {
             return false;
          }
+         mService->getLaunchEnv(mTempLaunchEnv);
       }
       launchCmds.push_back(shell);
       launchCmds.push_back(getScriptPath(getRemotePrefix()));
@@ -1399,9 +1404,13 @@ bool ServiceManager::waitReady(int timeout, ServicesContext* ctx)
    
    ShellExecutor shellExec(mState, &shEnv, mJobID);
    
+   ExprMultiKey* env = (ExprMultiKey*)mState->getContext("env");
+   env->mSlots[REnv_Step] = new ExprMap(mState);
    runner::v1::Result res = shellExec.execute(shEnv.getDefaultShell().c_str(),
                                               getWaitScript(mServiceID),
-                                              NULL, NULL, NULL, NULL);
+                                              env, NULL, NULL, NULL);
+   env->mSlots[REnv_Step] = NULL;
+   
    if (res == runner::v1::RESULT_FAILURE)
    {
       return false;
@@ -1421,9 +1430,13 @@ bool ServiceManager::stop()
    
    std::string outID;
    
+   ExprMultiKey* env = (ExprMultiKey*)mState->getContext("env");
+   env->mSlots[REnv_Step] = new ExprMap(mState);
    runner::v1::Result res = shellExec.execute(shEnv.getDefaultShell().c_str(),
                                               getStopScript(mServiceID),
-                                              NULL, NULL, NULL, NULL);
+                                              env, NULL, NULL, NULL);
+   env->mSlots[REnv_Step] = NULL;
+   
    if (res == runner::v1::RESULT_FAILURE)
    {
       return false;
@@ -1449,6 +1462,8 @@ bool ServiceManager::getExecCommands(std::vector<std::string>& cmds, const std::
       return false;
    }
    
+   // TODO: this needs to be inside the shell script
+   cmds.push_back("/usr/bin/env");
    cmds.push_back("podman");
    cmds.push_back("exec");
    cmds.push_back("--env-file");
@@ -1456,6 +1471,16 @@ bool ServiceManager::getExecCommands(std::vector<std::string>& cmds, const std::
    cmds.push_back("-it");
    cmds.push_back(mServiceID);
    return true;
+}
+
+void ServiceManager::getLaunchEnv(std::vector<std::string>& env)
+{
+   env.clear();
+   auto& baseEnv = mTask->_getRunner().env;
+   for (auto& kv : baseEnv)
+   {
+      env.push_back(kv.first + "=" + kv.second);
+   }
 }
 
 void ServiceManager::cleanup()
