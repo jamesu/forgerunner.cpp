@@ -959,7 +959,9 @@ std::string ServiceManager::getLaunchScript(Config& cfg)
    }
 
    // Launch podman
-   script << "podman run -d --rm $CONTAINER_LABEL --name $CONTAINER_NAME \\\n        $NETWORK \\\n        $PORTS \\\n        $VOLUMES \\\n        $ENV_VARS \\\n        $IMAGE";
+   script << "CONTAINER_ID=$(podman run -q -d --rm $CONTAINER_LABEL --name $CONTAINER_NAME \\\n        $NETWORK \\\n        $PORTS \\\n        $VOLUMES \\\n        $ENV_VARS \\\n        $IMAGE)\n";
+   
+   script << "echo \"id=$CONTAINER_ID\" >> $GITHUB_OUTPUT\n";
 
    return script.str();
 }
@@ -969,6 +971,11 @@ runner::v1::Result ServiceManager::start(Config& cfg, ServicesContext* ctx)
 {
    SHLaunchEnv shEnv;
    shEnv.mTempFilePrefix = MakeTempPrefix(mJobID);
+   
+   if (ctx == NULL)
+   {
+      return runner::v1::RESULT_FAILURE;
+   }
    
    if (!std::filesystem::is_directory(getLocalPrefix()))
    {
@@ -984,26 +991,27 @@ runner::v1::Result ServiceManager::start(Config& cfg, ServicesContext* ctx)
       outID += sdata;
    });
    
-   runner::v1::Result res = shellExec.execute(std::filesystem::temp_directory_path().string(), 
+   ExprMultiKey* env = (ExprMultiKey*)mState->getContext("env");
+   env->mSlots[REnv_Step] = new ExprMap(mState);
+   runner::v1::Result res = shellExec.execute(std::filesystem::temp_directory_path().string(),
                                               shEnv.getDefaultShell().c_str(),
                                               getLaunchScript(cfg),
-                                              (ExprMultiKey*)mState->getContext("env"), NULL, NULL, NULL);
+                                              env, NULL, ctx, NULL);
+   env->mSlots[REnv_Step] = NULL;
+   
    if (res == runner::v1::RESULT_FAILURE)
    {
       return res;
    }
    
-   outID = Trim(outID);
-   if (outID == "")
+   mServiceID = ctx->mId.getStringSafe();
+   
+   if (mServiceID == "")
    {
       return runner::v1::RESULT_FAILURE;
    }
    
-   mServiceID = outID;
-   if (ctx)
-   {
-      ctx->mId.setString(*mState->mStringTable, outID.c_str());
-   }
+   return res;
 }
 
 // Waits until service is ready, optionally updating context info
