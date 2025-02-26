@@ -1404,6 +1404,10 @@ bool ServiceManager::waitReady(int timeout, ServicesContext* ctx)
    
    ShellExecutor shellExec(mState, &shEnv, mJobID);
    
+   char buffer[512];
+   snprintf(buffer, sizeof(buffer), "Waiting for service %s to be ready...\n", mServiceID.c_str());
+   mTask->log(buffer);
+   
    ExprMultiKey* env = (ExprMultiKey*)mState->getContext("env");
    env->mSlots[REnv_Step] = new ExprMap(mState);
    runner::v1::Result res = shellExec.execute(shEnv.getDefaultShell().c_str(),
@@ -1429,6 +1433,12 @@ bool ServiceManager::stop()
    ShellExecutor shellExec(mState, &shEnv, mJobID);
    
    std::string outID;
+   
+   TaskTracker* task = mTask;
+   shellExec.setLogHandler([task](const char* data, size_t len) {
+      std::string sdata(data, len);
+      task->log(sdata.c_str());
+   });
    
    ExprMultiKey* env = (ExprMultiKey*)mState->getContext("env");
    env->mSlots[REnv_Step] = new ExprMap(mState);
@@ -2800,6 +2810,8 @@ public:
          return false;
       }
       
+      mgr->waitReady(0, ctx);
+      
       return true;
    }
    
@@ -2869,6 +2881,11 @@ public:
    
    void cleanupServices()
    {
+      if (mServices.size() > 0)
+      {
+         mTask->log("Cleaning up services...");
+      }
+      
       for (ServiceManager* mgr : mServices)
       {
          mgr->stop();
