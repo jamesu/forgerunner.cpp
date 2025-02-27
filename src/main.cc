@@ -63,6 +63,22 @@ enum
    REnv_COUNT
 };
 
+struct UsesInfo
+{
+   enum Kind
+   {
+      KIND_REMOTE,
+      KIND_LOCAL,
+      KIND_DOCKER
+   };
+   
+   std::string srcName;
+   std::string tag;
+   Kind kind;
+   
+   UsesInfo() : kind(KIND_REMOTE) {;}
+};
+
 // State to track runner auth and task version
 struct RunnerState
 {
@@ -1916,7 +1932,8 @@ struct SingleStepState
 class JobStepExecutor
 {
 public:
-   typedef std::function<JobStepExecutor*()> CreateFunc;
+   typedef std::function<JobStepExecutor*(const UsesInfo&)> CreateFunc;
+   typedef std::pair<std::string, UsesInfo::Kind> ExecKey;
    
    struct StepResult
    {
@@ -1927,8 +1944,9 @@ public:
    ExprState* mState;
    TaskTracker* mTask;
    SingleStepState mStepState;
+   UsesInfo mInfo;
 
-   JobStepExecutor() : mState(NULL), mTask(NULL)
+   JobStepExecutor(const UsesInfo& info) : mState(NULL), mTask(NULL), mInfo(info)
    {
    }
    virtual ~JobStepExecutor()
@@ -1940,26 +1958,36 @@ public:
       return {runner::v1::RESULT_FAILURE, false};
    }
    
-   template<class T> static T* createExecutor() { return new T(); }
+   template<class T> static T* createExecutor(const UsesInfo& s) { return new T(s); }
    
-    static void registerExecutor(const std::string& key, CreateFunc createFunc)
-    {
-        getRegistry()[key] = createFunc;
-    }
-
-    static CreateFunc getExecutor(const std::string& key)
-    {
-        auto& registry = getRegistry();
-        return registry.count(key) ? registry[key] : registry["default"];
-    }
+   static void registerExecutor(const std::string& srcName, UsesInfo::Kind kind, CreateFunc createFunc)
+   {
+      getRegistry()[{srcName, kind}] = createFunc;
+   }
+   
+   static CreateFunc getExecutor(const UsesInfo& info)
+   {
+      ExecKey exactKey = {info.srcName, info.kind};
+      ExecKey wildcardKey = {"*", info.kind};
+      auto& registry = getRegistry();
+      
+      if (registry.count(exactKey))
+      {
+         return registry[exactKey];
+      }
+      if (registry.count(wildcardKey))
+      {
+         return registry[wildcardKey];
+      }
+   }
 
 private:
    
-    static std::unordered_map<std::string, CreateFunc>& getRegistry()
-    {
-        static std::unordered_map<std::string, CreateFunc> registry;
-        return registry;
-    }
+   static std::map<ExecKey, CreateFunc>& getRegistry()
+   {
+      static std::map<ExecKey, CreateFunc> registry;
+      return registry;
+   }
 };
 
 struct JobStepDefinition : public BasicContext
@@ -2650,6 +2678,39 @@ void GetStepStateSteps(ExprState* exprState, ExprArray* stepList, JobStepsState&
    }
 }
 
+void ParseUses(const std::string& content, UsesInfo& result)
+{
+   const std::string dockerPrefix = "docker://";
+   const std::string localPrefix = "./";
+   size_t prefixSize = 0;
+   if (content.find(dockerPrefix) == 0)
+   {
+      result.kind = UsesInfo::KIND_DOCKER;
+      prefixSize = dockerPrefix.size();
+   }
+   else if (content.find(localPrefix) == 0)
+   {
+      result.kind = UsesInfo::KIND_LOCAL;
+   }
+   else
+   {
+      result.kind = UsesInfo::KIND_REMOTE;
+   }
+   
+   size_t tagPos = content.find(result.kind == UsesInfo::KIND_DOCKER ? ':' : '@');
+   
+   if (tagPos != std::string::npos)
+   {
+      result.srcName = content.substr(prefixSize, tagPos);
+      result.tag = content.substr(tagPos + 1);
+   }
+   else
+   {
+      result.srcName = content.substr(prefixSize);
+      result.tag = "latest";
+   }
+}
+
 void SetupExprState(TaskTracker* currentTask, ExprState* exprState)
 {
    // Set core env
@@ -2761,8 +2822,9 @@ public:
    int32_t mNumSteps;
    std::vector<ServiceManager*> mServices;
    ServiceManager* mRunService;
+   UsesInfo mInfo;
    
-   JobExecutor() : mState(NULL), mJob(NULL), mTask(NULL), mCurrentStep(0), mNumSteps(0), mRunService(NULL)
+   JobExecutor(const UsesInfo& info) : mState(NULL), mJob(NULL), mTask(NULL), mCurrentStep(0), mNumSteps(0), mRunService(NULL), mInfo(info)
    {
    }
    
@@ -2916,33 +2978,50 @@ public:
    
    virtual void handleJob() = 0;
    
-   typedef std::function<JobExecutor*()> CreateFunc;
+   typedef std::function<JobExecutor*(const UsesInfo&)> CreateFunc;
+   typedef std::pair<std::string, UsesInfo::Kind> ExecKey;
    
-   template<class T> static T* createExecutor() { return new T(); }
+   template<class T> static T* createExecutor(const UsesInfo& s) { return new T(s); }
    
-    static void registerExecutor(const std::string& key, CreateFunc createFunc)
-    {
-        getRegistry()[key] = createFunc;
-    }
-
-    static CreateFunc getExecutor(const std::string& key)
-    {
-        auto& registry = getRegistry();
-        return registry.count(key) ? registry[key] : registry["default"];
-    }
-
+   static void registerExecutor(const std::string& srcName, UsesInfo::Kind kind, CreateFunc createFunc)
+   {
+      getRegistry()[{srcName, kind}] = createFunc;
+   }
+   
+   static CreateFunc getExecutor(const UsesInfo& info)
+   {
+      ExecKey exactKey = {info.srcName, info.kind};
+      ExecKey wildcardKey = {"*", info.kind};
+      auto& registry = getRegistry();
+      
+      if (registry.count(exactKey))
+      {
+         return registry[exactKey];
+      }
+      if (registry.count(wildcardKey))
+      {
+         return registry[wildcardKey];
+      }
+   }
+   
 private:
    
-    static std::unordered_map<std::string, CreateFunc>& getRegistry()
-    {
-        static std::unordered_map<std::string, CreateFunc> registry;
-        return registry;
-    }
+   static std::map<ExecKey, CreateFunc>& getRegistry()
+   {
+      static std::map<ExecKey, CreateFunc> registry;
+      return registry;
+   }
 };
 
 class StandardStepExecutor : public JobStepExecutor
 {
 public:
+   
+   ServiceManager* mStepService;
+   
+   StandardStepExecutor(const UsesInfo& info) : JobStepExecutor(info)
+   {
+   }
    
    StepResult execute() override
    {
@@ -3017,6 +3096,10 @@ class ContainerStepExecutor : public JobStepExecutor
 class StandardJobExecutor : public JobExecutor
 {
 public:
+   
+   StandardJobExecutor(const UsesInfo& info) : JobExecutor(info)
+   {
+   }
    
    virtual void handleJob()
    {
@@ -3131,8 +3214,11 @@ public:
             stepUses = "default";
          }
          
+         UsesInfo usesInfo;
+         ParseUses(stepUses, usesInfo);
+         
          JobStepExecutor::StepResult stepResult = {runner::v1::RESULT_FAILURE, false};
-         JobStepExecutor::CreateFunc executorFunc = JobStepExecutor::getExecutor(stepUses);
+         JobStepExecutor::CreateFunc executorFunc = JobStepExecutor::getExecutor(usesInfo);
          if (executorFunc == NULL)
          {
             std::string err = std::string("Error: couldn't find executor: ") + stepUses;
@@ -3140,7 +3226,7 @@ public:
          }
          else
          {
-            JobStepExecutor* executor = executorFunc();
+            JobStepExecutor* executor = executorFunc(usesInfo);
             
             SingleStepState singleState;
             singleState.definition = step;
@@ -3214,7 +3300,10 @@ void PerformTask(TaskTracker* currentTask)
       jobUses = "default";
    }
    
-   JobExecutor::CreateFunc executorFunc = JobExecutor::getExecutor(jobUses);
+   UsesInfo usesInfo;
+   ParseUses(jobUses, usesInfo);
+   
+   JobExecutor::CreateFunc executorFunc = JobExecutor::getExecutor(usesInfo);
    if (executorFunc == NULL)
    {
       std::string err = std::string("Error: couldn't find executor: ") + jobUses;
@@ -3224,7 +3313,7 @@ void PerformTask(TaskTracker* currentTask)
    }
    else
    {
-      JobExecutor* executor = executorFunc();
+      JobExecutor* executor = executorFunc(usesInfo);
       executor->mState = exprState;
       executor->mJob = jobDefinition;
       executor->mJobName = jobName;
@@ -3262,8 +3351,8 @@ int main(int argc, char** argv)
    ExprFieldObject::registerFieldsForType<ServicesContext>();
    ExprFieldObject::registerFieldsForType<JobServiceDefinition>();
    
-   JobExecutor::registerExecutor("default", JobExecutor::createExecutor<StandardJobExecutor>);
-   JobStepExecutor::registerExecutor("default", JobStepExecutor::createExecutor<StandardStepExecutor>);
+   JobExecutor::registerExecutor("*", UsesInfo::KIND_REMOTE, JobExecutor::createExecutor<StandardJobExecutor>);
+   JobStepExecutor::registerExecutor("*", UsesInfo::KIND_REMOTE, JobStepExecutor::createExecutor<StandardStepExecutor>);
    
    RunnerState state;
    state.tasks_version = 0;
