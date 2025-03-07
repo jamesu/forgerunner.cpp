@@ -88,6 +88,7 @@ struct RunnerState
    std::string token;
    std::string localWorkspaceRoot;
    std::string remoteWorkspaceRoot;
+   std::string envPath;
    runner::v1::Runner info;
    std::unordered_map<std::string, std::string> env;
 };
@@ -273,9 +274,11 @@ std::string MakeTempPrefix(const std::string& jobID)
 }
 
 
+class WrappedEnv;
+
 struct LaunchEnv
 {
-   ServiceManager* mService; 
+   WrappedEnv* mService;
    std::string mTempFilePrefix; // std::to_string(GET_PID()) + "-run-" + mJobID
    std::vector<std::string> mTempLaunchEnv;
    std::string mWorkingDirectory;
@@ -299,6 +302,10 @@ struct LaunchEnv
    }
    
    virtual std::string getLocalPrefix()
+   {
+      return "";
+   }
+   virtual std::string getLaunchPrefix()
    {
       return "";
    }
@@ -418,8 +425,24 @@ template<> void ExprFieldObject::registerFieldsForType<ServicesContext>()
 }
 
 class TaskTracker;
+class LaunchEnv;
 
-class ServiceManager
+class WrappedEnv
+{
+public:
+   WrappedEnv() {;}
+   
+   virtual bool getExecCommands(std::vector<std::string>& cmds, const std::string& envFile) = 0;
+   virtual void getLaunchEnv(std::vector<std::string>& env) = 0;
+   virtual bool hasExecCommands() = 0;
+   virtual bool writeScript(LaunchEnv* env, std::basic_ostream<char>& stream, const std::string& cwd, const std::string& cmdList) = 0;
+   
+   virtual std::string getLocalPrefix() = 0;
+   virtual std::string getLaunchPrefix() = 0;
+   virtual std::string getRemotePrefix() = 0;
+};
+
+class ServiceManager : public WrappedEnv
 {
 public:
    struct Config
@@ -437,6 +460,8 @@ public:
       ExprValue network; // [internal]
       ExprValue image; // image:
       ExprValue env; // env:
+      std::string envFile;
+      std::string imageArgs;
       std::string name; // launch name
       std::string id; // [key]
       std::string label; // launch label
@@ -462,7 +487,18 @@ public:
    
    static std::string getStopScript(const std::string& ident);
    
+   static void writeLaunchParameters(std::basic_ostream<char>& script, Config& cfg);
    static std::string getLaunchScript(Config& cfg);
+   bool hasExecCommands() override
+   {
+      return true;
+   }
+   
+   bool writeScript(LaunchEnv* env, std::basic_ostream<char>& stream, const std::string& cwd, const std::string& cmdList) override
+   {
+      return false;
+   }
+   
    
    // starts service, storing id in context info
    runner::v1::Result start(Config& cfg, ServicesContext* ctx);
@@ -472,15 +508,54 @@ public:
    // Stops service
    bool stop();
    
-   std::string getLocalPrefix();
+   std::string getLocalPrefix() override;
    
-   std::string getRemotePrefix();
+   std::string getLaunchPrefix() override;
    
-   bool getExecCommands(std::vector<std::string>& cmds, const std::string& envFile);
+   std::string getRemotePrefix() override;
    
-   void getLaunchEnv(std::vector<std::string>& env);
+   bool getExecCommands(std::vector<std::string>& cmds, const std::string& envFile) override;
+   
+   void getLaunchEnv(std::vector<std::string>& env) override;
    
    void cleanup();
+};
+
+class ContainerRunWrapper : public WrappedEnv
+{
+public:
+   
+   std::string mFolderPrefix;
+   std::string mImageName;
+   TaskTracker* mTask;
+   
+   ContainerRunWrapper() : mTask(NULL) {;}
+   
+   bool getExecCommands(std::vector<std::string>& cmds, const std::string& envFile) override;
+   void getLaunchEnv(std::vector<std::string>& env) override;
+   
+   std::string getLocalPrefix() override
+   {
+      return std::filesystem::temp_directory_path() / mFolderPrefix;
+   }
+   
+   std::string getLaunchPrefix() override
+   {
+      return getLocalPrefix();
+   }
+   
+   std::string getRemotePrefix() override
+   {
+      return "/tmp/input";
+   }
+   
+   bool hasExecCommands() override
+   {
+      return false;
+   }
+   
+   bool writeScript(LaunchEnv* env, std::basic_ostream<char>& stream, const std::string& cwd, const std::string& cmdList) override;
+   
 };
 
 class ShellExecutor
@@ -758,6 +833,11 @@ public:
       return mService ? mService->getLocalPrefix() : std::filesystem::temp_directory_path().string();
    }
    
+   std::string getLaunchPrefix() override
+   {
+      return mService ? mService->getLaunchPrefix() : getRemotePrefix();
+   }
+   
    std::string getRemotePrefix() override
    {
       return mService ? mService->getRemotePrefix() : std::filesystem::temp_directory_path().string();
@@ -781,10 +861,13 @@ public:
    void writeScript(const std::string& cwd, const std::string& cmdList) override
    {
       std::ofstream outFile(getScriptPath(getLocalPrefix()), std::ios::binary);
-      outFile << "set -e\n";
-      outFile << "cd \"" + cwd + "\"\n";
-      outFile << cmdList;
-      outFile << "\n";
+      if (!mService->writeScript(this, outFile, cwd, cmdList))
+      {
+         outFile << "set -e\n";
+         outFile << "cd \"" + cwd + "\"\n";
+         outFile << cmdList;
+         outFile << "\n";
+      }
       outFile.close();
    }
    
@@ -812,7 +895,7 @@ public:
          mService->getLaunchEnv(mTempLaunchEnv);
       }
       launchCmds.push_back(shell);
-      launchCmds.push_back(getScriptPath(getRemotePrefix()));
+      launchCmds.push_back(getScriptPath(getLaunchPrefix()));
       launchEnv = mTempLaunchEnv;
       return true;
    }
@@ -829,6 +912,11 @@ public:
    std::string getLocalPrefix() override
    {
       return mService ? mService->getLocalPrefix() : std::filesystem::temp_directory_path().string();
+   }
+   
+   std::string getLaunchPrefix() override
+   {
+      return mService ? mService->getLaunchPrefix() : getRemotePrefix();
    }
    
    std::string getRemotePrefix() override
@@ -851,10 +939,13 @@ public:
    void writeScript(const std::string& cwd, const std::string& cmdList) override
    {
       std::ofstream outFile(getScriptPath(getLocalPrefix()), std::ios::binary);
-      outFile << "$ErrorActionPreference = \"Stop\"\n";
-      outFile << "cd \"" + cwd + "\"\n";
-      outFile << cmdList;
-      outFile << "\n";
+      if (!mService->writeScript(this, outFile, cwd, cmdList))
+      {
+         outFile << "$ErrorActionPreference = \"Stop\"\n";
+         outFile << "cd \"" + cwd + "\"\n";
+         outFile << cmdList;
+         outFile << "\n";
+      }
       outFile.close();
    }
    
@@ -873,7 +964,7 @@ public:
    bool getLaunchCommand(const std::string& shell, std::vector<std::string>& launchCmds, std::vector<std::string>& launchEnv) override
    {
       launchCmds.clear();
-      if (mService)
+      if (mService && mService->hasExecCommands())
       {
          if (!mService->getExecCommands(launchCmds, (std::filesystem::path(getLocalPrefix()) / (mTempFilePrefix + ".env")).string()))
          {
@@ -1238,9 +1329,8 @@ std::string ServiceManager::getStopScript(const std::string& ident)
    return script.str();
 }
 
-std::string ServiceManager::getLaunchScript(Config& cfg)
+void ServiceManager::writeLaunchParameters(std::basic_ostream<char>& script, Config& cfg)
 {
-   std::ostringstream script;
    std::vector<ExprValue> tmpItems;
    script << "set -e\n\n";
    
@@ -1255,6 +1345,7 @@ std::string ServiceManager::getLaunchScript(Config& cfg)
       return "";
    }
    script << "IMAGE=\"" << image << "\"\n";
+   script << "IMAGE_ARGS=(" << cfg.imageArgs << ")\n";
    script << "podman pull $IMAGE\n";
    
    // Extracting network
@@ -1267,7 +1358,7 @@ std::string ServiceManager::getLaunchScript(Config& cfg)
    
    std::string label = cfg.name;
    if (!cfg.label.empty()) {
-      script << "CONTAINER_LABEL=\"--label " << network << "=true\"\n";
+      script << "CONTAINER_LABEL=\"--label " << cfg.label << "=true\"\n";
    } else {
       script << "CONTAINER_LABEL=\"\"\n";
    }
@@ -1331,6 +1422,14 @@ std::string ServiceManager::getLaunchScript(Config& cfg)
    }
    script << "\"\n";
    
+   // Set env file
+   script << "ENV_FILE=\"";
+   if (!cfg.envFile.empty())
+   {
+      script << " --env-file " << cfg.envFile;
+   }
+   script << "\"\n";
+   
    // Credentials (if needed for private registry)
    ExprObject* credentials = cfg.credentials.getObject();
    if (credentials)
@@ -1351,6 +1450,12 @@ std::string ServiceManager::getLaunchScript(Config& cfg)
       script << "\"--entrypoint [\\\"tail\\\",\\\"-f\\\",\\\"/dev/null\\\"]\"";
    }
    script << "\n";
+}
+
+std::string ServiceManager::getLaunchScript(Config& cfg)
+{
+   std::ostringstream script;
+   writeLaunchParameters(script, cfg);
    
    // Launch podman
    script << "CONTAINER_ID=$(podman run -q -d --rm $CONTAINER_LABEL --name $CONTAINER_NAME \\\n        $NETWORK \\\n        $PORTS \\\n        $VOLUMES \\\n        $ENV_VARS \\\n $ENTRYPOINT        $IMAGE)\n";
@@ -1476,6 +1581,11 @@ std::string ServiceManager::getLocalPrefix()
    return std::filesystem::temp_directory_path() / mFolderPrefix;
 }
 
+std::string ServiceManager::getLaunchPrefix()
+{
+   return getLocalPrefix();
+}
+
 std::string ServiceManager::getRemotePrefix()
 {
    return "/tmp/input";
@@ -1488,8 +1598,7 @@ bool ServiceManager::getExecCommands(std::vector<std::string>& cmds, const std::
       return false;
    }
    
-   // TODO: this needs to be inside the shell script
-   cmds.push_back("/usr/bin/env");
+   cmds.push_back(mTask->_getRunner().envPath);
    cmds.push_back("podman");
    cmds.push_back("exec");
    cmds.push_back("--env-file");
@@ -1540,6 +1649,7 @@ bool SetupRunner(CURL *curl, RunnerState& state, int argc, char** argv)
    state.endpoint = "http://localhost:3000";
    state.localWorkspaceRoot = std::filesystem::current_path();
    state.remoteWorkspaceRoot = "/workspace";
+   state.envPath = "/usr/bin/env";
    
    // Parse args
    for (int i = 1; i < argc; ++i) 
@@ -2697,11 +2807,11 @@ void ParseUses(const std::string& content, UsesInfo& result)
       result.kind = UsesInfo::KIND_REMOTE;
    }
    
-   size_t tagPos = content.find(result.kind == UsesInfo::KIND_DOCKER ? ':' : '@');
+   size_t tagPos = content.find_last_of(result.kind == UsesInfo::KIND_DOCKER ? ':' : '@');
    
    if (tagPos != std::string::npos)
    {
-      result.srcName = content.substr(prefixSize, tagPos);
+      result.srcName = content.substr(prefixSize, tagPos-prefixSize);
       result.tag = content.substr(tagPos + 1);
    }
    else
@@ -2861,7 +2971,7 @@ public:
          {
             jobCtx->mServices.getObject()->setMapKey(cfg.name, ExprValue().setObject(ctx));
          }
-         else
+         else if (cfg.mode == ServiceManager::Config::CONTAINER)
          {
             jobCtx->mContainer.setObject(ctx);
          }
@@ -3017,8 +3127,6 @@ class StandardStepExecutor : public JobStepExecutor
 {
 public:
    
-   ServiceManager* mStepService;
-   
    StandardStepExecutor(const UsesInfo& info) : JobStepExecutor(info)
    {
    }
@@ -3058,13 +3166,14 @@ public:
       SHLaunchEnv shEnv;
       PSHLaunchEnv psEnv;
       LaunchEnv* theEnv = &shEnv;
-      theEnv->mService = mStepState.service; // associated service to run inside
-      shEnv.mWorkingDirectory = theEnv->mService ? mTask->_getRunner().remoteWorkspaceRoot : mTask->_getRunner().localWorkspaceRoot;
       
       if (isPowerShell)
       {
          theEnv = &psEnv;
       }
+      
+      theEnv->mService = mStepState.service; // associated service to run inside
+      theEnv->mWorkingDirectory = theEnv->mService ? mTask->_getRunner().remoteWorkspaceRoot : mTask->_getRunner().localWorkspaceRoot;
       
       TaskTracker* task = mTask;
       ShellExecutor shellExec(mState, theEnv, std::to_string(mTask->_getTask().id()));
@@ -3090,8 +3199,147 @@ public:
 // Variant of JobStepExecutor which runs command inside a container
 class ContainerStepExecutor : public JobStepExecutor
 {
+   ContainerRunWrapper mWrappedEnv;
    
+public:
+   ContainerStepExecutor(const UsesInfo& info) : JobStepExecutor(info)
+   {
+   }
+   
+   StepResult execute() override
+   {
+      char buffer[512];
+      bool continueOnError = mStepState.definition->mContinueOnError.getBool();
+      
+      EvaluateAllKeys(dynamic_cast<ExprMap*>(mStepState.definition->mEnv.getObject())); // resolve keys for STEP
+      
+      snprintf(buffer, sizeof(buffer), "Doing something in step %i...", mStepState.index);
+      mTask->log(buffer);
+      
+      ExprMap* stepMap = mStepState.context ? mStepState.context->mOutputs.asObject<ExprMap>() : NULL;
+      runner::v1::Result result = internalExecute();
+      
+      if (mStepState.context)
+      {
+         mStepState.context->mOutcome.setString(*mState->mStringTable, RunnerResultToString(result));
+         mStepState.context->mConclusion.setString(*mState->mStringTable, RunnerResultToString(result));
+      }
+      
+      return { result, continueOnError };
+   }
+   
+   runner::v1::Result internalExecute()
+   {
+      std::string cmdToRun;
+      
+      ExprObject* withContext = mStepState.definition->mWith.getObject();
+      if (withContext)
+      {
+         cmdToRun = mState->substituteExpressions(withContext->getMapKey("args").getStringSafe());
+      }
+      char buffer[4096];
+      snprintf(buffer, sizeof(buffer), "TODO: run %s", cmdToRun.c_str());
+      mTask->log(buffer);
+      
+      std::string jobID = std::to_string(mTask->_getTask().id());
+      bool isPowerShell = strcmp(mStepState.definition->mShell.getStringSafe(), "powershell.exe") == 0;
+      
+      mWrappedEnv.mFolderPrefix = MakeTempPrefix(jobID + "-stepc");
+      mWrappedEnv.mImageName = mInfo.srcName;
+      mWrappedEnv.mTask = mTask;
+      if (!mInfo.tag.empty())
+      {
+         mWrappedEnv.mImageName += ":" + mInfo.tag;
+      }
+      
+      SHLaunchEnv shEnv;
+      PSHLaunchEnv psEnv;
+      LaunchEnv* theEnv = &shEnv;
+      
+      if (isPowerShell)
+      {
+         theEnv = &psEnv;
+      }
+      
+      theEnv->mWorkingDirectory = mTask->_getRunner().remoteWorkspaceRoot;
+      theEnv->mService = &mWrappedEnv;// i.e. specified docker service
+      
+      if (!std::filesystem::is_directory(theEnv->getLocalPrefix()))
+      {
+         printf("CONTAINER STEP: creating directory=%s\n", theEnv->getLocalPrefix().c_str());
+         std::filesystem::create_directory(theEnv->getLocalPrefix());
+      }
+      
+      TaskTracker* task = mTask;
+      ShellExecutor shellExec(mState, theEnv, std::to_string(mTask->_getTask().id()));
+      shellExec.setLogHandler([task](const char* data, size_t len) {
+         std::string sdata(data, len);
+         task->log(sdata.c_str());
+      });
+      
+      if (mStepState.definition->mCwd.getString())
+      {
+         theEnv->mWorkingDirectory = mStepState.definition->mCwd.getString();
+      }
+      
+      std::string shell = mStepState.definition->mShell.getString() ? mStepState.definition->mShell.getString() : theEnv->getDefaultShell();
+      
+      return shellExec.execute(shell, cmdToRun, mStepState.env, mStepState.outputEnv, mStepState.outputStep, mStepState.outputPath);
+   }
 };
+
+
+bool ContainerRunWrapper::getExecCommands(std::vector<std::string>& cmds, const std::string& envFile)
+{
+   if (mFolderPrefix == "")
+   {
+      return false;
+   }
+   
+   // TODO: this needs to be inside the shell script
+   /*cmds.push_back(mTask->_getRunner().envPath);
+   cmds.push_back("podman");
+   cmds.push_back("run");
+   cmds.push_back("--env-file");
+   cmds.push_back(envFile);
+   cmds.push_back("-it");
+   cmds.push_back(mImageName);*/
+   return true;
+   
+}
+
+void ContainerRunWrapper::getLaunchEnv(std::vector<std::string>& env)
+{
+   env.clear();
+   auto& baseEnv = mTask->_getRunner().env;
+   for (auto& kv : baseEnv)
+   {
+      env.push_back(kv.first + "=" + kv.second);
+   }
+}
+
+bool ContainerRunWrapper::writeScript(LaunchEnv* env, std::basic_ostream<char>& outFile, const std::string& cwd, const std::string& cmdList)
+{
+   ServiceManager::Config cfg;
+   cfg.workspaceLocal = mTask->_getRunner().localWorkspaceRoot;
+   cfg.workspaceRemote = mTask->_getRunner().remoteWorkspaceRoot;
+   cfg.mode = ServiceManager::Config::USES;
+   cfg.image.setString(*mTask->_getExprState()->mStringTable, mImageName.c_str());
+   cfg.imageArgs = cmdList;
+   cfg.tmpMount = env->getLocalPrefix();
+   cfg.label = "tmp_container_run";
+   cfg.name = "tmp_container_run";
+   
+   std::string outputPath;
+   std::string pathPath;
+   env->getOutputPaths(env->getLocalPrefix(), cfg.envFile, outputPath, pathPath);
+   
+   ServiceManager::writeLaunchParameters(outFile, cfg);
+   outFile << "podman run -q -it --rm $CONTAINER_LABEL --name $CONTAINER_NAME \\\n        $NETWORK \\\n        $PORTS \\\n        $VOLUMES \\\n        $ENV_FILE \\\n $ENTRYPOINT        $IMAGE ${IMAGE_ARGS[@]}\n";
+   
+   return true;
+}
+
 
 class StandardJobExecutor : public JobExecutor
 {
@@ -3353,6 +3601,7 @@ int main(int argc, char** argv)
    
    JobExecutor::registerExecutor("*", UsesInfo::KIND_REMOTE, JobExecutor::createExecutor<StandardJobExecutor>);
    JobStepExecutor::registerExecutor("*", UsesInfo::KIND_REMOTE, JobStepExecutor::createExecutor<StandardStepExecutor>);
+   JobStepExecutor::registerExecutor("*", UsesInfo::KIND_DOCKER, JobStepExecutor::createExecutor<ContainerStepExecutor>);
    
    RunnerState state;
    state.tasks_version = 0;
