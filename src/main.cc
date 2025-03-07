@@ -1603,7 +1603,6 @@ bool ServiceManager::getExecCommands(std::vector<std::string>& cmds, const std::
    cmds.push_back("exec");
    cmds.push_back("--env-file");
    cmds.push_back(envFile);
-   cmds.push_back("-it");
    cmds.push_back(mServiceID);
    return true;
 }
@@ -3296,14 +3295,6 @@ bool ContainerRunWrapper::getExecCommands(std::vector<std::string>& cmds, const 
       return false;
    }
    
-   // TODO: this needs to be inside the shell script
-   /*cmds.push_back(mTask->_getRunner().envPath);
-   cmds.push_back("podman");
-   cmds.push_back("run");
-   cmds.push_back("--env-file");
-   cmds.push_back(envFile);
-   cmds.push_back("-it");
-   cmds.push_back(mImageName);*/
    return true;
    
 }
@@ -3335,7 +3326,7 @@ bool ContainerRunWrapper::writeScript(LaunchEnv* env, std::basic_ostream<char>& 
    env->getOutputPaths(env->getLocalPrefix(), cfg.envFile, outputPath, pathPath);
    
    ServiceManager::writeLaunchParameters(outFile, cfg);
-   outFile << "podman run -q -it --rm $CONTAINER_LABEL --name $CONTAINER_NAME \\\n        $NETWORK \\\n        $PORTS \\\n        $VOLUMES \\\n        $ENV_FILE \\\n $ENTRYPOINT        $IMAGE ${IMAGE_ARGS[@]}\n";
+   outFile << "podman run -q --rm $CONTAINER_LABEL --name $CONTAINER_NAME \\\n        $NETWORK \\\n        $PORTS \\\n        $VOLUMES \\\n        $ENV_FILE \\\n $ENTRYPOINT        $IMAGE ${IMAGE_ARGS[@]}\n";
    
    return true;
 }
